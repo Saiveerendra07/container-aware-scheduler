@@ -1,0 +1,7 @@
+*.o
+*.out
+__pycache__/
+.venv/
+results/raw/*
+results/processed/*
+graphs/*
