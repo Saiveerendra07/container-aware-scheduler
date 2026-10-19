@@ -1,5 +1,6 @@
 *.o
 *.out
+workloads/cpu_worker
 __pycache__/
 .venv/
 results/raw/*
