@@ -4,5 +4,11 @@ workloads/cpu_worker
 __pycache__/
 .venv/
 results/raw/*
+!results/raw/README*
+!results/raw/docs/
+!results/raw/docs/**
 results/processed/*
+!results/processed/README*
+!results/processed/docs/
+!results/processed/docs/**
 graphs/*
