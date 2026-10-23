@@ -1,0 +1,364 @@
+# Container-Aware Group CPU Scheduler
+
+> **Project status:** The Linux `sched_ext` BPF scheduler and userspace loader
+> are implemented, but have **not been validated at runtime**. Existing runner
+> measurements use the default Linux scheduler. Do not claim a custom-scheduler
+> comparison until it has been run and measured on a compatible Linux system.
+
+## Overview
+
+Containers often run side by side on the same machine and compete for CPU
+time. This project explores how to account for CPU time by workload group,
+with the longer-term goal of making CPU sharing between containers more
+predictable and measurable.
+
+The repository contains CPU-bound workloads and experiment runners, an
+ordinary cgroup-v2 experiment path, and an early custom group scheduler built
+with Linux `sched_ext` and eBPF. It also includes tools for analyzing and
+plotting measurements. The custom scheduler is experimental code; the current
+data and analysis tools do not establish that it improves scheduling.
+
+## Problem and motivation
+
+The default Linux scheduler schedules runnable tasks, but does not implement
+this project's intended group-level weighted policy. Cgroup CPU controls can
+apply relative weights (`cpu.weight`) or bandwidth limits (`cpu.max`), which
+are useful controls and baselines. They do not exercise the custom scheduler's
+own group accounting and dispatch policy.
+
+The project therefore keeps these paths distinct: ordinary runs establish
+workload behavior under the active default scheduler; cgroup runs test
+standard cgroup CPU controls; and a future sched_ext evaluation will test the
+custom policy under controlled conditions. A fair comparison still needs
+repeatable workloads, useful per-group measurements, a compatible kernel,
+and careful control of other CPU limits and system load.
+
+## What is implemented
+
+- **CPU worker and supervisor:** `workloads/cpu_worker.c` runs a synthetic
+  CPU-bound loop for a requested duration and reports iterations. The C
+  supervisor, `workloads/cpu_supervisor.c`, launches/reaps a worker, measures
+  its user and system CPU time with `wait4()`, and tracks monotonic elapsed
+  time. The group runner builds the supervisor for each run.
+- **Baseline and CPU competition runners:** `scripts/run_cpu_baseline.sh`
+  runs one worker; `scripts/run_cpu_competition.sh` runs 1–32 workers
+  concurrently. They save timestamped text records in `results/raw/` and use
+  the active default scheduler.
+- **Group competition measurements:** `scripts/run_group_competition.sh`
+  starts labeled groups of workers and writes per-worker CSV rows, including
+  CPU time, elapsed time, iterations, and status. Group labels are metadata:
+  this runner does not set cgroups, shares, quotas, priorities, or scheduler
+  policy.
+- **Cgroup-v2 experiment path:** `scripts/run_cgroup_competition.sh` checks
+  for cgroup-v2 and CPU-controller access, or runs two workers in temporary
+  child groups with explicit `cpu.weight` or `cpu.max` settings. It requires an
+  already delegated, writable parent with CPU control enabled. It uses the
+  default Linux scheduler and does not attach sched_ext.
+- **Custom scheduler and loader:** `src/group_scheduler.bpf.c` implements a
+  sched_ext struct-ops scheduler with per-group dispatch queues and weighted
+  virtual-time accounting. `src/group_scheduler.c` parses group cgroup IDs and
+  shares, loads the BPF program, attaches it, and handles shutdown. The
+  scheduler accepts 2–8 exact cgroup IDs plus a fallback share. This code
+  builds only with the dependencies described below and still needs runtime
+  validation on a suitable system.
+- **Analysis and plotting:** `scripts/analyze_results.py` reads compatible
+  group-competition CSV files and derives per-worker CPU usage and a Jain
+  index. `scripts/plot_results.py` plots analyzer summaries when measurements
+  are available (Matplotlib is needed to render figures).
+- **Experiment suite and report generator:**
+  `scripts/run_experiment_suite.sh` repeats the existing baseline and CPU
+  competition runners and records a manifest. Its `--dry-run` option previews
+  commands without launching workloads. `scripts/generate_experiment_report.sh`
+  analyzes existing group-competition CSVs and plots the derived summary; it
+  does not run workloads.
+
+Implemented code is not the same as validated runtime behavior. In particular,
+the custom scheduler has not yet been attached and evaluated in a supported
+runtime environment. The ordinary cgroup path is also dependent on the target
+machine's delegation and has not been presented here as a completed controlled
+evaluation.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  W[CPU worker] --> B[Baseline runner]
+  W --> C[CPU competition runner]
+  W --> G[Group competition runner]
+  W --> CG[Cgroup-v2 competition runner]
+  S[CPU supervisor] --> G
+  B --> RT[(results/raw text)]
+  C --> RT
+  G --> RC[(results/raw group CSV + worker logs)]
+  CG --> D[Temporary cgroup-v2 groups<br/>cpu.weight or cpu.max]
+  D --> W
+  SCX[ sched_ext BPF scheduler<br/>src/group_scheduler.bpf.c ] --> L[Userspace loader<br/>src/group_scheduler.c]
+  L -. explicit future runtime evaluation .-> G
+  RC --> A[analyze_results.py]
+  A --> P[(results/processed summary CSV)]
+  P --> PL[plot_results.py]
+  PL --> GR[(graphs/*.png)]
+  P --> R[generate_experiment_report.sh<br/>orchestrates analysis + plot]
+```
+
+The dotted scheduler relationship indicates a future evaluation setup, not an
+automatic connection: no runner starts the loader. The suite covers baseline
+and CPU competition only. Cgroup experiments use kernel cgroup controls rather
+than the custom scheduler.
+
+## Repository structure
+
+| Path | Purpose |
+| --- | --- |
+| `src/` | sched_ext BPF policy and userspace loader source |
+| `include/` | Shared scheduler configuration definitions |
+| `workloads/` | CPU worker and worker supervisor source |
+| `scripts/` | Workload runners, cgroup setup, experiment suite, analysis, plotting, report wrapper |
+| `tests/` | Python `unittest` coverage for validation and analysis/report logic |
+| `docs/` | Detailed runner, scheduler, cgroup, experiment, and analysis guides |
+| `results/raw/` | Append-only runner outputs; preserve original records |
+| `results/processed/` | Derived summaries, suite manifests, and report directories |
+| `graphs/` | Generated plots; filenames are unique to avoid overwriting |
+| `Makefile` | Builds the custom sched_ext loader and generated BPF artifacts |
+
+## Quick start
+
+From the repository root, inspect the available files and script interfaces:
+
+```sh
+rg --files
+bash scripts/run_experiment_suite.sh --help
+bash scripts/run_cgroup_competition.sh --help
+python3 scripts/analyze_results.py --help
+python3 scripts/plot_results.py --help
+bash scripts/generate_experiment_report.sh --help
+```
+
+Run safe checks that do not start workloads or require cgroup privileges:
+
+```sh
+bash -n scripts/*.sh
+python3 -m unittest discover -s tests -v
+bash scripts/run_experiment_suite.sh --dry-run
+```
+
+The test suite uses temporary files/directories and does not require a
+sched_ext-capable kernel. The cgroup check is read-only, but may correctly fail
+on a machine without a writable delegated cgroup parent:
+
+```sh
+bash scripts/run_cgroup_competition.sh --check
+```
+
+To build the ordinary CPU worker before running workload examples:
+
+```sh
+gcc -O2 -Wall -Wextra -std=c11 workloads/cpu_worker.c -o workloads/cpu_worker
+```
+
+The `make` target builds the **custom scheduler loader**, not the workload. It
+requires Clang with BPF support, `bpftool`, libbpf development files (version
+1.5 or newer), readable kernel BTF, and sched_ext compatibility headers. See
+`docs/scheduler-design.md` before attempting that build.
+
+## Examples
+
+### Default-scheduler workloads
+
+These commands execute CPU workloads and write new files under `results/raw/`:
+
+```sh
+scripts/run_cpu_baseline.sh 3
+scripts/run_cpu_competition.sh 4 5
+```
+
+The first runs one worker for three seconds. The second starts four workers,
+each for five seconds. Neither command applies cgroup controls or attaches the
+custom scheduler.
+
+To run the labeled, measured group runner (also executes workers):
+
+```sh
+scripts/run_group_competition.sh latency=2 batch=2 3
+```
+
+`latency`, `batch`, and `background` are labels only. This is not a latency
+benchmark and does not impose group shares.
+
+### Ordinary cgroup-v2 controls
+
+First check the default cgroup root or provide a delegated parent:
+
+```sh
+bash scripts/run_cgroup_competition.sh --check --parent "$HOME/delegated-cgroup"
+```
+
+This check is read-only. Preview a two-group weight setup without writes or
+workload execution:
+
+```sh
+bash scripts/run_cgroup_competition.sh --dry-run --parent "$HOME/delegated-cgroup" \
+  --weight-a 200 --weight-b 100 --duration 5
+```
+
+Run the actual cgroup experiment (executes two workers and writes only within
+the delegated cgroup subtree):
+
+```sh
+bash scripts/run_cgroup_competition.sh --parent "$HOME/delegated-cgroup" \
+  --weight-a 200 --weight-b 100 --duration 5
+```
+
+The script requires the parent to be writable and the CPU controller already
+enabled for child cgroups. It does not use `sudo`, enable controllers, change
+global CPU settings, or attach sched_ext. See
+[`docs/cgroup-experiments.md`](docs/cgroup-experiments.md) for quota examples
+and cleanup behavior.
+
+### Analyze group-runner CSVs and generate plots
+
+Analyze compatible group-competition CSVs (read-only by default):
+
+```sh
+python3 scripts/analyze_results.py
+python3 scripts/analyze_results.py results/raw/group_competition_RUN.csv \
+  --output results/processed/group_summary.csv
+```
+
+The default input glob excludes the documented incomplete debugging artifact;
+explicit paths are analyzed as supplied. Plot a summary after analysis:
+
+```sh
+python3 scripts/plot_results.py results/processed/group_summary.csv
+```
+
+This writes unique PNGs under `graphs/` if usable measurements exist and
+Matplotlib is installed. The combined report command also only analyzes and
+plots existing data; it does not run workloads:
+
+```sh
+bash scripts/generate_experiment_report.sh \
+  --graphs-dir graphs results/raw/group_competition_RUN.csv
+```
+
+### Custom scheduler build and future runtime evaluation
+
+Build the loader only on a machine with the required BPF, libbpf, BTF, and
+sched_ext headers:
+
+```sh
+make
+# or, if the sched_ext source tree is elsewhere:
+make SCX_ROOT=/path/to/scx-c-examples
+```
+
+This build does not attach the scheduler. Running `build/group_scheduler`
+would explicitly load and attach sched_ext and requires a compatible kernel,
+suitable privileges, carefully prepared cgroups, and a recovery plan. The
+loader's actual configuration is `--fallback-share SHARE` plus at least two
+`--group CGROUP_ID:SHARE` options. Do not run it as a routine quick-start
+command; the custom scheduler has not yet been runtime validated. See
+[`docs/scheduler-design.md`](docs/scheduler-design.md).
+
+## Metrics: available and missing
+
+- **Elapsed time:** The group runner records monotonic elapsed time per worker.
+  The CPU competition runner records total run elapsed time at centisecond
+  resolution. The baseline record includes requested duration and worker
+  output, but does not independently measure elapsed time.
+- **CPU time:** The group runner's C supervisor records direct-worker user and
+  system CPU time using `wait4()`; `cpu_time_s` is their sum. It does not
+  include arbitrary descendants. The baseline and CPU competition text
+  runners do not collect per-worker CPU time.
+- **CPU usage percentage:** The analyzer derives
+  `100 * cpu_time_s / elapsed_s` for a worker. This is average use as a
+  percentage of one CPU over that worker's interval, not total machine CPU
+  utilization. It can be unavailable or slightly above 100% due to interval
+  and accounting differences.
+- **Jain's fairness index:** The analyzer derives
+  `(sum(cpu_time)^2) / (n * sum(cpu_time^2))` from workers with valid CPU-time
+  measurements in a run. It describes equality among workers (1.0 means equal
+  CPU time), not weighted fairness between groups or scheduler quality.
+- **Throttling and latency:** The current analysis does not collect cgroup
+  `cpu.stat` throttling deltas, request latency, tail latency, or scheduler
+  overhead. The cgroup runner applies configured controls but does not yet
+  record these metrics. The worker reports iterations, which are not a latency
+  or fairness measurement.
+
+The plotting tool can graph derived per-worker CPU usage and per-run Jain
+index. These are based on existing default-scheduler group-runner results and
+must not be presented as a comparison with the custom scheduler.
+
+## Requirements and platform limitations
+
+The CPU worker requires a C compiler such as GCC. The ordinary runners use
+Bash and standard Linux utilities. Python 3's standard library is sufficient
+for analysis; Matplotlib is required only when plots with usable data are
+rendered. The scheduler build additionally requires Clang BPF support,
+`bpftool`, `pkg-config`, libbpf development files version 1.5 or newer,
+readable `/sys/kernel/btf/vmlinux`, and sched_ext headers (by default under
+`~/scx-c-examples`).
+
+In the repository's tested WSL2 environment (kernel
+`6.6.87.2-microsoft-standard-WSL2`), the sched_ext interface is not exposed, so that environment
+cannot validate attaching the custom scheduler. Runtime evaluation needs a
+Linux kernel with sched_ext support and the relevant interfaces enabled; the
+task-cgroup lookup path also depends on kernel support described in the
+scheduler design document.
+
+Cgroup experiments need cgroup v2, an already delegated writable parent, and
+the CPU controller enabled for child groups. A cgroup-v2 mount alone is not
+enough. The script intentionally does not enable controllers or request
+privileges. Use a parent set up by the system administrator or experiment
+environment.
+
+## Current status and limitations
+
+The project has an initial BPF group scheduler, a loader, ordinary workload
+runners, cgroup controls, and analysis utilities. **The custom scheduler has
+not yet been validated at runtime.** Existing result files are from ordinary
+default-scheduler runs and development checks; they are not evidence of custom
+scheduler behavior. Do not claim a custom-scheduler speedup, fairness result,
+or successful runtime test until a controlled evaluation is performed on
+supported hardware and kernel.
+
+The scheduler matches exact cgroup IDs, uses a single fallback group, and
+assumes group membership remains unchanged while it is attached. Shares are
+not reservations; the policy does not implement hierarchy-aware accounting,
+dynamic share updates, migration-aware accounting, or a runtime statistics
+interface. The cgroup runner also does not yet persist a structured result
+file or capture throttling counters.
+
+## Future work
+
+1. **Build and runtime validation:** build on a sched_ext-capable Linux host;
+   check verifier/load/attach behavior, shutdown, and recovery before measuring.
+2. **Cgroup measurements:** record before/after `cpu.stat` counters and
+   per-group CPU-time data for cgroup weight and quota runs.
+3. **Controlled comparisons:** run repeated, documented baseline, cgroup, and
+   custom-scheduler cases with fixed workloads, group membership, machine
+   conditions, and scheduler configuration.
+4. **Analysis and plots:** extend analysis to group-level results and
+   throttling; add plots only for metrics actually recorded and label each
+   scheduling mode clearly.
+5. **Final evaluation:** report limitations, variability, and results from
+   actual institute-PC measurements; do not substitute synthetic or
+   unvalidated outcomes.
+
+## Contributing and safety
+
+Before submitting a change, run the non-privileged test suite and shell syntax
+checks:
+
+```sh
+python3 -m unittest discover -s tests -v
+bash -n scripts/*.sh
+```
+
+Tests do not require sched_ext runtime support. Preserve existing raw results;
+analysis writes derived output separately. Workload commands consume CPU and
+write new result records. Cgroup runs modify settings only inside the
+explicitly selected delegated subtree and should be started deliberately.
+Loading the custom scheduler requires an explicit invocation, a compatible
+kernel, suitable privileges, prepared cgroups, and a recovery plan. No build,
+test, or report command in this README automatically attaches it.
