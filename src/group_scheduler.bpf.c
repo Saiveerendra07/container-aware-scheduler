@@ -13,6 +13,13 @@ struct {
 	__type(value, __u64);
 } group_vtime SEC(".maps");
 
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, GROUP_SCHEDULER_MAX_SCHED_GROUPS);
+	__type(key, __u32);
+	__type(value, __u64);
+} group_running_count SEC(".maps");
+
 struct cpu_runtime_ctx {
 	__u64 start_runtime;
 	__u32 group_index;
@@ -60,6 +67,109 @@ static __u64 group_share(__u32 index)
 	return scheduler_config.groups[index].share;
 }
 
+/*
+ * A group which has been idle must not keep an old virtual-time advantage (or
+ * penalty). Rebase an empty DSQ to the minimum virtual time among groups which
+ * are queued or still running. The atomic compare/exchange avoids losing a
+ * concurrent runtime charge from stopping().
+ */
+static bool rebase_idle_group(__u32 index)
+{
+	__u64 *own_vtime;
+	__u64 min_vtime = 0;
+	__u32 own_key = index;
+	__u32 i;
+	bool have_active_group = false;
+	s32 queued;
+
+	queued = scx_bpf_dsq_nr_queued(index);
+	if (queued < 0) {
+		scx_bpf_error("failed to inspect group queue during enqueue");
+		return false;
+	}
+	if (queued)
+		return true;
+
+	own_vtime = bpf_map_lookup_elem(&group_vtime, &own_key);
+	if (!own_vtime) {
+		scx_bpf_error("group virtual-time lookup failed during enqueue");
+		return false;
+	}
+
+	/* A running task keeps the group's virtual time active even with an empty DSQ. */
+	{
+		__u64 *running_count;
+
+		running_count = bpf_map_lookup_elem(&group_running_count, &own_key);
+		if (!running_count) {
+			scx_bpf_error("group running-count lookup failed during enqueue");
+			return false;
+		}
+		if (*running_count)
+			return true;
+	}
+
+	bpf_for(i, 0, GROUP_SCHEDULER_MAX_SCHED_GROUPS) {
+		__u64 *vtime;
+		__u64 *running_count;
+		__u32 key = i;
+
+		if (i == index)
+			continue;
+		queued = scx_bpf_dsq_nr_queued(i);
+		if (queued < 0) {
+			scx_bpf_error("failed to inspect group queue during rebase");
+			return false;
+		}
+		running_count = bpf_map_lookup_elem(&group_running_count, &key);
+		if (!running_count) {
+			scx_bpf_error("group running-count lookup failed during rebase");
+			return false;
+		}
+		if (!queued && !*running_count)
+			continue;
+
+		vtime = bpf_map_lookup_elem(&group_vtime, &key);
+		if (!vtime) {
+			scx_bpf_error("group virtual-time lookup failed during rebase");
+			return false;
+		}
+		if (!have_active_group || time_before(*vtime, min_vtime)) {
+			min_vtime = *vtime;
+			have_active_group = true;
+		}
+	}
+
+	/* No competitors means no old virtual-time state should carry forward. */
+	if (!have_active_group)
+		min_vtime = 0;
+
+	/* Retry a few races with stopping(); failure only postpones this rebase. */
+	for (int retry = 0; retry < 4; retry++) {
+		__u64 current = *own_vtime;
+
+		if (current == min_vtime)
+			return true;
+		if ((__u64)__sync_val_compare_and_swap(own_vtime, current,
+							 min_vtime) == current)
+			return true;
+	}
+	return true;
+}
+
+static void mark_group_stopped(__u32 index)
+{
+	__u32 key = index;
+	__u64 *running_count;
+
+	running_count = bpf_map_lookup_elem(&group_running_count, &key);
+	if (!running_count || !*running_count) {
+		scx_bpf_error("group running count is invalid during stopping");
+		return;
+	}
+	__sync_fetch_and_sub(running_count, 1);
+}
+
 s32 BPF_STRUCT_OPS(group_select_cpu, struct task_struct *p, s32 prev_cpu,
 		   u64 wake_flags)
 {
@@ -76,6 +186,8 @@ void BPF_STRUCT_OPS(group_enqueue, struct task_struct *p, u64 enq_flags)
 		scx_bpf_error("invalid group index during enqueue");
 		return;
 	}
+	if (!rebase_idle_group(index))
+		return;
 
 	scx_bpf_dsq_insert(p, index, SCX_SLICE_DFL, enq_flags);
 }
@@ -126,6 +238,22 @@ void BPF_STRUCT_OPS(group_running, struct task_struct *p)
 
 	runtime_ctx->group_index = find_group_index(p);
 	runtime_ctx->start_runtime = p->se.sum_exec_runtime;
+	runtime_ctx->running = 0;
+	{
+		__u32 running_key = runtime_ctx->group_index;
+		__u64 *running_count;
+
+		if (running_key >= GROUP_SCHEDULER_MAX_SCHED_GROUPS) {
+			scx_bpf_error("invalid group index during running");
+			return;
+		}
+		running_count = bpf_map_lookup_elem(&group_running_count, &running_key);
+		if (!running_count) {
+			scx_bpf_error("group running-count lookup failed during running");
+			return;
+		}
+		__sync_fetch_and_add(running_count, 1);
+	}
 	runtime_ctx->running = 1;
 }
 
@@ -151,10 +279,11 @@ void BPF_STRUCT_OPS(group_stopping, struct task_struct *p, bool runnable)
 		scx_bpf_error("invalid group index during stopping");
 		return;
 	}
-
 	runtime = p->se.sum_exec_runtime - runtime_ctx->start_runtime;
-	if (!runtime)
+	if (!runtime) {
+		mark_group_stopped(index);
 		return;
+	}
 
 	share = group_share(index);
 	if (!share) {
@@ -171,6 +300,7 @@ void BPF_STRUCT_OPS(group_stopping, struct task_struct *p, bool runnable)
 
 	__sync_fetch_and_add(vtime,
 			     runtime * scheduler_config.total_share / share);
+	mark_group_stopped(index);
 }
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(group_init)

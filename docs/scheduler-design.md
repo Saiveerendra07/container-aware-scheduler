@@ -12,10 +12,14 @@ The BPF side creates a FIFO dispatch queue for each configured group and one
 for the fallback group. Each has a shared virtual-time counter. At each
 dispatch, the scheduler selects a nonempty group with the lowest current
 virtual time and moves one task from that group's queue to the local dispatch
-queue. Tasks already waiting in a group queue therefore do not retain an old
-cross-group priority. Tasks whose exact cgroup ID is not configured, or whose
-cgroup cannot be looked up, use the fallback queue; ordinary tasks handled by
-this scheduler do not bypass group accounting through `SCX_DSQ_GLOBAL`.
+queue. When a group queue becomes active after being empty, its virtual time is
+rebased to the minimum virtual time of groups that are queued or running. This
+prevents an idle group's stale virtual time from giving it an accumulated
+advantage or penalty when it wakes. Running-group counts keep groups active
+while their tasks are in a CPU-local queue. Tasks whose exact cgroup ID is not
+configured, or whose cgroup cannot be looked up, use the fallback queue;
+ordinary tasks handled by this scheduler do not bypass group accounting
+through `SCX_DSQ_GLOBAL`.
 
 When a task stops running, the scheduler charges the difference in the
 kernel-maintained `p->se.sum_exec_runtime` value since its `running` callback,
@@ -90,9 +94,10 @@ for each run; it does not provide migration-aware accounting.
 
 The policy approximates weighted group fairness; it does not promise a strict
 CPU-time ratio. Concurrent CPUs can make dispatch choices before a group's
-newly running tasks have been charged, and tasks within each group use FIFO
-order rather than per-task weighted fairness. The fallback group combines all
-unmatched tasks rather than providing per-cgroup fairness. There is no
+newly running tasks have been charged, and queue/running state can change while
+an idle-group virtual-time rebase is being computed. Tasks within each group
+use FIFO order rather than per-task weighted fairness. The fallback group
+combines all unmatched tasks rather than providing per-cgroup fairness. There is no
 hierarchy-aware share aggregation, dynamic share update, runtime statistics
 interface, CPU topology policy, or guarantee of a particular fraction when
 groups are idle or constrained elsewhere.
