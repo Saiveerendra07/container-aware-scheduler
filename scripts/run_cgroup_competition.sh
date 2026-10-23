@@ -107,22 +107,83 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd -- "$script_dir/.." && pwd)
 worker="$repo_root/workloads/cpu_worker"
 [[ -x $worker ]] || fail "missing workload executable: build workloads/cpu_worker first"
+command -v python3 >/dev/null 2>&1 || fail 'Python 3 is required to write the result CSV'
 
 run_id="codex_cgroup_${BASHPID}_$(date +%s)"
 group_a="$parent/${run_id}_a"
 group_b="$parent/${run_id}_b"
+results_dir="$repo_root/results/raw"
+mkdir -p -- "$results_dir"
+timestamp=$(date -u '+%Y%m%dT%H%M%SZ')
+result_file=$(mktemp "$results_dir/cgroup_competition_${timestamp}_XXXXXX.csv")
+run_id=${result_file##*/}
+run_id=${run_id%.csv}
+tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/cgroup_metrics_${BASHPID}_XXXXXX")
+metadata_file="$tmp_dir/metadata.tsv"
+metrics_helper="$script_dir/cgroup_metrics.py"
+printf 'run_id\ttimestamp_utc\tkernel_version\tlogical_cpu_count\trequested_duration_s\tcontrol_setting\tgroup\tcgroup_path\tworkload_elapsed_s\texit_status\tmeasurement_status\tbefore_stat\tafter_stat\n' >"$metadata_file"
 created=()
 pids=()
+groups=("$group_a" "$group_b")
+group_names=(A B)
+start_files=("$tmp_dir/a.timing" "$tmp_dir/b.timing")
+before_files=("$tmp_dir/a.before" "$tmp_dir/b.before")
+after_files=("$tmp_dir/a.after" "$tmp_dir/b.after")
+worker_statuses=(NA NA)
+run_timestamp=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+kernel_version=$(uname -r)
+logical_cpu_count=$(getconf _NPROCESSORS_ONLN)
+setting=
+if [[ -n $weight_a ]]; then setting="cpu.weight A=$weight_a B=$weight_b"
+else setting="cpu.max A=$quota_a B=$quota_b"; fi
+
+uptime_ticks() { awk '{ printf "%.0f", $1 * 100 }' /proc/uptime; }
+job_is_running() {
+    local target=$1 running
+    while IFS= read -r running; do
+        [[ $running == "$target" ]] && return 0
+    done < <(jobs -pr)
+    return 1
+}
+
 cleanup() {
-    local status=$? pid
+    local status=$? pid index start_ticks end_ticks elapsed worker_status measure_status
     trap - EXIT INT TERM
     set +e
-    for pid in "${pids[@]}"; do kill -TERM "$pid" 2>/dev/null; done
+    for pid in "${pids[@]}"; do
+        if job_is_running "$pid"; then
+            kill -TERM "$pid" 2>/dev/null
+        fi
+    done
     for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null; done
+    for index in 0 1; do
+        [[ -d ${groups[index]} ]] && cat -- "${groups[index]}/cpu.stat" >"${after_files[index]}" 2>/dev/null
+        start_ticks= end_ticks= worker_status=NA elapsed=NA measure_status=incomplete
+        if [[ -r ${start_files[index]} ]]; then
+            IFS=$'\t' read -r start_ticks end_ticks worker_status <"${start_files[index]}" || true
+            if [[ $start_ticks =~ ^[0-9]+$ && $end_ticks =~ ^[0-9]+$ ]] && (( end_ticks >= start_ticks )); then
+                elapsed=$(awk -v s="$start_ticks" -v e="$end_ticks" 'BEGIN { printf "%.2f", (e-s)/100 }')
+                measure_status=complete
+            fi
+        fi
+        [[ $worker_status =~ ^[0-9]+$ ]] || worker_status=NA
+        [[ $measure_status == complete && $worker_status == 0 ]] || measure_status=incomplete
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$run_id" "$run_timestamp" "$kernel_version" "$logical_cpu_count" "$duration" \
+            "$setting" "${group_names[index]}" "${groups[index]}" "$elapsed" "$worker_status" \
+            "$measure_status" "${before_files[index]}" "${after_files[index]}" >>"$metadata_file"
+    done
+    if ! python3 "$metrics_helper" "$metadata_file" "$result_file"; then
+        printf 'Failed to write cgroup metrics CSV: %s\n' "$result_file" >&2
+        status=1
+    else
+        printf 'Saved result: %s\n' "$result_file" >&2
+    fi
     for ((i=${#created[@]}-1; i>=0; i--)); do rmdir -- "${created[i]}" 2>/dev/null || {
         printf 'Cleanup could not remove empty cgroup %s (check for remaining processes).\n' "${created[i]}" >&2
         status=1
     }; done
+    rm -rf -- "$tmp_dir"
     exit "$status"
 }
 trap cleanup EXIT
@@ -132,7 +193,7 @@ trap 'exit 143' TERM
 mkdir -- "$group_a"; created+=("$group_a")
 mkdir -- "$group_b"; created+=("$group_b")
 for group in "$group_a" "$group_b"; do
-    [[ -w $group/cgroup.procs && -w $group/cpu.weight && -w $group/cpu.max ]] || fail "required writable interfaces missing in $group"
+    [[ -w $group/cgroup.procs && -w $group/cpu.weight && -w $group/cpu.max && -r $group/cpu.stat ]] || fail "required cgroup CPU interfaces missing in $group"
 done
 if [[ -n $weight_a ]]; then
     printf '%s\n' "$weight_a" >"$group_a/cpu.weight"
@@ -143,10 +204,54 @@ else
     printf '%s\n' "${quota_b/// }" >"$group_b/cpu.max"
     setting="cpu.max A=$quota_a B=$quota_b"
 fi
+cat -- "$group_a/cpu.stat" >"${before_files[0]}" 2>/dev/null || true
+cat -- "$group_b/cpu.stat" >"${before_files[1]}" 2>/dev/null || true
 printf 'Scheduler: default Linux scheduler (ordinary cgroup CPU control; custom sched_ext is not attached)\n'
 printf 'Parent: %s\nSetting: %s\nDuration: %s seconds\n' "$parent" "$setting" "$duration"
-( printf '%s\n' "$BASHPID" >"$group_a/cgroup.procs"; exec "$worker" "$duration" ) & pids+=("$!")
-( printf '%s\n' "$BASHPID" >"$group_b/cgroup.procs"; exec "$worker" "$duration" ) & pids+=("$!")
+(
+    worker_pid=
+    start_ticks=
+    stop_worker() {
+        [[ -n $worker_pid ]] && kill -TERM "$worker_pid" 2>/dev/null
+        [[ -n $worker_pid ]] && wait "$worker_pid" 2>/dev/null
+        end_ticks=$(uptime_ticks)
+        printf '%s\t%s\t143\n' "$start_ticks" "$end_ticks" >"${start_files[0]}"
+        exit 143
+    }
+    trap stop_worker INT TERM
+    if ! printf '%s\n' "$BASHPID" >"$group_a/cgroup.procs"; then
+        printf 'NA\tNA\t125\n' >"${start_files[0]}"
+        exit 125
+    fi
+    start_ticks=$(uptime_ticks)
+    "$worker" "$duration" & worker_pid=$!
+    if wait "$worker_pid"; then worker_status=0; else worker_status=$?; fi
+    end_ticks=$(uptime_ticks)
+    printf '%s\t%s\t%s\n' "$start_ticks" "$end_ticks" "$worker_status" >"${start_files[0]}"
+    exit "$worker_status"
+) & pids+=("$!")
+(
+    worker_pid=
+    start_ticks=
+    stop_worker() {
+        [[ -n $worker_pid ]] && kill -TERM "$worker_pid" 2>/dev/null
+        [[ -n $worker_pid ]] && wait "$worker_pid" 2>/dev/null
+        end_ticks=$(uptime_ticks)
+        printf '%s\t%s\t143\n' "$start_ticks" "$end_ticks" >"${start_files[1]}"
+        exit 143
+    }
+    trap stop_worker INT TERM
+    if ! printf '%s\n' "$BASHPID" >"$group_b/cgroup.procs"; then
+        printf 'NA\tNA\t125\n' >"${start_files[1]}"
+        exit 125
+    fi
+    start_ticks=$(uptime_ticks)
+    "$worker" "$duration" & worker_pid=$!
+    if wait "$worker_pid"; then worker_status=0; else worker_status=$?; fi
+    end_ticks=$(uptime_ticks)
+    printf '%s\t%s\t%s\n' "$start_ticks" "$end_ticks" "$worker_status" >"${start_files[1]}"
+    exit "$worker_status"
+) & pids+=("$!")
 status=0
 for pid in "${pids[@]}"; do wait "$pid" || status=1; done
 printf 'Workers finished; temporary cgroups will be removed.\n'

@@ -4,9 +4,9 @@ set -Eeuo pipefail
 
 usage() {
     cat <<'EOF'
-Usage: generate_experiment_report.sh [options] [raw_group_competition.csv ...]
+Usage: generate_experiment_report.sh [options] [raw_group_or_cgroup_competition.csv ...]
 
-Analyze existing group-competition CSV results, save a unique summary under
+Analyze existing group-competition and cgroup-competition CSV results, save a unique summary under
 results/processed/, and plot that exact summary. No workloads are run.
 
 Options:
@@ -14,7 +14,7 @@ Options:
   --graphs-dir DIR     Figure directory (default: graphs/)
   -h, --help           Show this help
 
-With no CSV paths, the analyzer uses its default results/raw input glob.
+With no CSV paths, the analyzer reads both supported result formats from results/raw/.
 EOF
 }
 

@@ -52,8 +52,10 @@ and careful control of other CPU limits and system load.
 - **Cgroup-v2 experiment path:** `scripts/run_cgroup_competition.sh` checks
   for cgroup-v2 and CPU-controller access, or runs two workers in temporary
   child groups with explicit `cpu.weight` or `cpu.max` settings. It requires an
-  already delegated, writable parent with CPU control enabled. It uses the
-  default Linux scheduler and does not attach sched_ext.
+  already delegated, writable parent with CPU control enabled. It captures
+  before/after `cpu.stat`, workload elapsed time, and exit status into a unique
+  CSV under `results/raw/`. It uses the default Linux scheduler and does not
+  attach sched_ext.
 - **Custom scheduler and loader:** `src/group_scheduler.bpf.c` implements a
   sched_ext struct-ops scheduler with per-group dispatch queues and weighted
   virtual-time accounting. `src/group_scheduler.c` parses group cgroup IDs and
@@ -62,9 +64,11 @@ and careful control of other CPU limits and system load.
   builds only with the dependencies described below and still needs runtime
   validation on a suitable system.
 - **Analysis and plotting:** `scripts/analyze_results.py` reads compatible
-  group-competition CSV files and derives per-worker CPU usage and a Jain
-  index. `scripts/plot_results.py` plots analyzer summaries when measurements
-  are available (Matplotlib is needed to render figures).
+  group-competition and cgroup-competition CSV files. It derives per-worker
+  CPU usage and Jain index for group runs, and cgroup CPU time, usage, and
+  throttling summaries for cgroup runs. `scripts/plot_results.py` produces
+  separate group-runner and cgroup measurement graphs when valid data exists
+  (Matplotlib is needed to render figures).
 - **Experiment suite and report generator:**
   `scripts/run_experiment_suite.sh` repeats the existing baseline and CPU
   competition runners and records a manifest. Its `--dry-run` option previews
@@ -89,8 +93,9 @@ flowchart LR
   S[CPU supervisor] --> G
   B --> RT[(results/raw text)]
   C --> RT
-  G --> RC[(results/raw group CSV + worker logs)]
+  G --> RC[(results/raw group and cgroup CSVs + worker logs)]
   CG --> D[Temporary cgroup-v2 groups<br/>cpu.weight or cpu.max]
+  CG --> RC
   D --> W
   SCX[ sched_ext BPF scheduler<br/>src/group_scheduler.bpf.c ] --> L[Userspace loader<br/>src/group_scheduler.c]
   L -. explicit future runtime evaluation .-> G
@@ -113,7 +118,7 @@ than the custom scheduler.
 | `src/` | sched_ext BPF policy and userspace loader source |
 | `include/` | Shared scheduler configuration definitions |
 | `workloads/` | CPU worker and worker supervisor source |
-| `scripts/` | Workload runners, cgroup setup, experiment suite, analysis, plotting, report wrapper |
+| `scripts/` | Workload runners, cgroup setup and `cpu.stat` CSV helper, experiment suite, analysis, plotting, report wrapper |
 | `tests/` | Python `unittest` coverage for validation and analysis/report logic |
 | `docs/` | Detailed runner, scheduler, cgroup, experiment, and analysis guides |
 | `results/raw/` | Append-only runner outputs; preserve original records |
@@ -215,18 +220,23 @@ global CPU settings, or attach sched_ext. See
 [`docs/cgroup-experiments.md`](docs/cgroup-experiments.md) for quota examples
 and cleanup behavior.
 
-### Analyze group-runner CSVs and generate plots
+### Analyze competition CSVs and generate plots
 
-Analyze compatible group-competition CSVs (read-only by default):
+Analyze both supported result formats (read-only raw inputs):
 
 ```sh
-python3 scripts/analyze_results.py
-python3 scripts/analyze_results.py results/raw/group_competition_RUN.csv \
-  --output results/processed/group_summary.csv
+python3 scripts/analyze_results.py --output results/processed/summary.csv
+python3 scripts/plot_results.py results/processed/summary.csv
 ```
 
-The default input glob excludes the documented incomplete debugging artifact;
-explicit paths are analyzed as supplied. Plot a summary after analysis:
+With no input paths, the analyzer reads both `group_competition_*.csv` and
+`cgroup_competition_*.csv` from `results/raw/`, excluding the documented
+incomplete debugging artifact. The commands above therefore include both
+formats when their raw files are present. Explicit paths can also be combined
+as `python3 scripts/analyze_results.py path/to/group.csv path/to/cgroup.csv --output results/processed/summary.csv`.
+If the requested summary filename already exists, a unique suffix preserves it.
+
+To plot an existing summary separately:
 
 ```sh
 python3 scripts/plot_results.py results/processed/group_summary.csv
@@ -265,11 +275,15 @@ command; the custom scheduler has not yet been runtime validated. See
 - **Elapsed time:** The group runner records monotonic elapsed time per worker.
   The CPU competition runner records total run elapsed time at centisecond
   resolution. The baseline record includes requested duration and worker
-  output, but does not independently measure elapsed time.
+  output, but does not independently measure elapsed time. The cgroup runner
+  records per-group workload elapsed time from `/proc/uptime` at centisecond
+  resolution, including small launch and wait overhead.
 - **CPU time:** The group runner's C supervisor records direct-worker user and
   system CPU time using `wait4()`; `cpu_time_s` is their sum. It does not
   include arbitrary descendants. The baseline and CPU competition text
-  runners do not collect per-worker CPU time.
+  runners do not collect per-worker CPU time. The cgroup runner records
+  cgroup-level `usage_usec`, `user_usec`, and `system_usec` deltas, which may
+  include small runner overhead and are not worker-only measurements.
 - **CPU usage percentage:** The analyzer derives
   `100 * cpu_time_s / elapsed_s` for a worker. This is average use as a
   percentage of one CPU over that worker's interval, not total machine CPU
@@ -279,15 +293,24 @@ command; the custom scheduler has not yet been runtime validated. See
   `(sum(cpu_time)^2) / (n * sum(cpu_time^2))` from workers with valid CPU-time
   measurements in a run. It describes equality among workers (1.0 means equal
   CPU time), not weighted fairness between groups or scheduler quality.
-- **Throttling and latency:** The current analysis does not collect cgroup
-  `cpu.stat` throttling deltas, request latency, tail latency, or scheduler
-  overhead. The cgroup runner applies configured controls but does not yet
-  record these metrics. The worker reports iterations, which are not a latency
-  or fairness measurement.
+- **Throttling and latency:** The group-results analyzer does not collect
+  cgroup `cpu.stat` throttling deltas. The cgroup analyzer converts valid
+  `usage_usec_delta` into CPU seconds and average CPU usage percentage, and
+  reports `nr_throttled_delta` (throttled periods), `throttled_usec_delta`
+  converted to seconds, and throttled-period percentage when the period count
+  is valid. The cgroup runner records cgroup-level
+  before/after values for `usage_usec`, `user_usec`, `system_usec`,
+  `nr_periods`, `nr_throttled`, and `throttled_usec`, plus per-group workload
+  elapsed time and exit status. It does not measure request or tail latency,
+  fairness, or scheduler overhead. The worker reports iterations, which are
+  not a latency or fairness measurement. Missing or invalid kernel counters
+  are written as `NA`; see [`docs/cgroup-experiments.md`](docs/cgroup-experiments.md)
+  for the CSV schema.
 
-The plotting tool can graph derived per-worker CPU usage and per-run Jain
-index. These are based on existing default-scheduler group-runner results and
-must not be presented as a comparison with the custom scheduler.
+The plotting tool can graph per-worker CPU usage and Jain index for group
+results, and cgroup CPU usage and throttling in separate graphs. Cgroup
+measurements use the default Linux scheduler and must not be presented as
+custom sched_ext results. The graphs preserve that distinction in their titles.
 
 ## Requirements and platform limitations
 
@@ -326,21 +349,20 @@ The scheduler matches exact cgroup IDs, uses a single fallback group, and
 assumes group membership remains unchanged while it is attached. Shares are
 not reservations; the policy does not implement hierarchy-aware accounting,
 dynamic share updates, migration-aware accounting, or a runtime statistics
-interface. The cgroup runner also does not yet persist a structured result
-file or capture throttling counters.
+interface. Analysis supports the default-scheduler cgroup CSV separately; it
+does not compare these measurements to custom sched_ext results.
 
 ## Future work
 
 1. **Build and runtime validation:** build on a sched_ext-capable Linux host;
    check verifier/load/attach behavior, shutdown, and recovery before measuring.
-2. **Cgroup measurements:** record before/after `cpu.stat` counters and
-   per-group CPU-time data for cgroup weight and quota runs.
+2. **Cgroup evaluation:** collect repeated cgroup runs and interpret quota
+   throttling carefully alongside host load and parent-level limits.
 3. **Controlled comparisons:** run repeated, documented baseline, cgroup, and
    custom-scheduler cases with fixed workloads, group membership, machine
    conditions, and scheduler configuration.
-4. **Analysis and plots:** extend analysis to group-level results and
-   throttling; add plots only for metrics actually recorded and label each
-   scheduling mode clearly.
+4. **Analysis and plots:** extend comparisons only when custom scheduler
+   measurements and compatible metrics have been collected.
 5. **Final evaluation:** report limitations, variability, and results from
    actual institute-PC measurements; do not substitute synthetic or
    unvalidated outcomes.

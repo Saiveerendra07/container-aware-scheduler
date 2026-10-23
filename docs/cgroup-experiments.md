@@ -16,7 +16,8 @@ scheduler results.
   the parent administrator or institute setup must delegate this in advance.
 - `workloads/cpu_worker` built with the command in
   [the baseline guide](cpu-baseline-runner.md).
-- Bash and standard Linux tools. No sched_ext kernel support or build is needed.
+- Bash, Python 3 (standard library only), and standard Linux tools. No
+  sched_ext kernel support or build is needed.
 
 No `sudo` is used. Do not point `--parent` at a cgroup containing important
 workloads. The selected parent must allow creating children and writing
@@ -62,9 +63,40 @@ bash scripts/run_cgroup_competition.sh --parent "$HOME/my-delegated-cgroup" \
 Exactly one complete settings pair is required. Quota periods are limited to
 1000..1000000 microseconds; use `max/PERIOD` for an unlimited quota. The two
 workers start concurrently, print their ordinary worker output, and the script
-reports the chosen controls and successful cleanup. Interrupt with Ctrl-C to
-stop both children and trigger cgroup cleanup. Check the exit status; a failed
-worker or cleanup produces a nonzero result.
+reports the chosen controls, writes a unique CSV under `results/raw/`, and
+removes the temporary groups. Interrupt with Ctrl-C to stop both workers and
+trigger cgroup cleanup. Check the exit status; a failed worker or cleanup
+produces a nonzero result. Existing result files are never overwritten.
+
+## Measurements and CSV columns
+
+The output has one row for group `A` and one for group `B`. Common columns are
+`run_id`, `timestamp_utc`, `kernel_version`, `logical_cpu_count`,
+`requested_duration_s`, `control_setting`, `group`, and `cgroup_path`.
+`workload_elapsed_s` is measured around the worker invocation using Linux
+`/proc/uptime` (centisecond resolution); it includes small launch and wait
+overhead. `exit_status` is the worker's exit code where available. A numeric
+status with `measurement_status=incomplete` indicates an unsuccessful or
+interrupted run; missing timing/status values remain `NA`.
+
+For each of `usage_usec`, `user_usec`, `system_usec`, `nr_periods`,
+`nr_throttled`, and `throttled_usec`, the CSV has `<counter>_before`,
+`<counter>_after`, and `<counter>_delta` columns. Values are read from each
+group's `cpu.stat` immediately before and after the workload. Deltas are
+computed only when both values are present, valid nonnegative integers, and
+the after value is not lower than the before value. Otherwise the affected
+value or delta is `NA`; no missing measurement is inferred.
+`cpu_stat_status` is `complete` when all six deltas are available, `partial`
+when some are available, and `unavailable` when none are available. The
+captured counters are cgroup totals and can include small runner overhead in
+addition to the worker. `usage_usec` is CPU runtime, not a percentage;
+`nr_throttled` and `throttled_usec` report kernel throttling accounting when
+available. They do not measure request latency or scheduler overhead.
+
+As with any interval counters, other processes must not be placed in the
+temporary test groups. Parent-level limits and unrelated system load can still
+affect the experiment. The runner does not derive CPU usage percentages,
+fairness, or policy effectiveness from these counters.
 
 ## Relationship to the custom scheduler and limitations
 
@@ -77,9 +109,9 @@ the numeric cgroup IDs and preserving fixed membership during the run.
 `cpu.weight` is a relative share among runnable sibling cgroups and is not a
 reservation. `cpu.max` imposes a bandwidth cap and can throttle a group; it is
 not a relative-share setting. Results depend on parent limits, CPU topology,
-other system load, kernel configuration, and worker duration. This initial
-runner prints worker output but does not collect CPU-time, throttling, latency,
-fairness, or scheduler-overhead metrics and does not create a result CSV. Do
-not infer these measures from iteration counts. Record the host, kernel,
-delegated parent, control values, and competing load when performing formal
-evaluation. The institute-PC evaluation remains future work.
+other system load, kernel configuration, and worker duration. The CSV records
+cgroup CPU-time and throttling counters where available, but it does not
+measure latency, fairness, or scheduler overhead. Do not infer these measures
+from iteration counts. Record the host, kernel, delegated parent, control
+values, and competing load when performing formal evaluation. The
+institute-PC evaluation remains future work.

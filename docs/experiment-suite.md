@@ -45,10 +45,11 @@ status, runner log, and raw result path reported by that runner. Existing
 suite directories are not overwritten. The runners continue to store their
 own uniquely named raw result files under `results/raw/`.
 
-The baseline and CPU-competition runners produce text results. The current
-`scripts/analyze_results.py` accepts group-competition CSV files only, so do
-not pass these text files to it. Use that analyzer for compatible group-runner
-CSV files; this suite intentionally does not combine incompatible formats.
+The baseline and CPU-competition runners produce text results. The
+`scripts/analyze_results.py` accepts compatible group-competition and
+cgroup-competition CSV files; do not pass the suite's baseline or
+CPU-competition text logs to it. The suite intentionally does not combine
+incompatible formats.
 
 The baseline text file records one worker's output and exit status. The
 competition text file records each worker's output and status plus total

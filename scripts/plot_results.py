@@ -56,12 +56,25 @@ def read_summaries(paths):
 def plot_data(records):
     """Extract only finite, nonnegative measurements represented in summaries."""
     cpu_rows = []
+    cgroup_rows = []
     fairness_by_run = {}
     warnings = []
     for row in records:
         run_id = row.get("run_id", "").strip()
-        worker_id = row.get("worker_id", "").strip()
         group = row.get("group", "").strip() or "unspecified"
+        if row.get("result_type") == "cgroup_competition":
+            usage = parse_number(row.get("cpu_usage_pct"))
+            periods = parse_number(row.get("nr_throttled_delta"))
+            throttle_s = parse_number(row.get("throttled_time_s"))
+            if run_id and any(value is not None and value >= 0 for value in (usage, periods, throttle_s)):
+                cgroup_rows.append({"run_id": run_id, "group": group,
+                                    "usage": usage if usage is not None and usage >= 0 else None,
+                                    "throttled_periods": periods if periods is not None and periods >= 0 else None,
+                                    "throttled_time_s": throttle_s if throttle_s is not None and throttle_s >= 0 else None,
+                                    "measurement_status": row.get("measurement_status", "unknown"),
+                                    "exit_status": row.get("exit_status", "NA")})
+            continue
+        worker_id = row.get("worker_id", "").strip()
         if not run_id or not worker_id:
             warnings.append(f"{row['_summary_file']}:{row['_line']}: missing run or worker ID; skipped")
             continue
@@ -83,7 +96,7 @@ def plot_data(records):
                 warnings.append(f"run {run_id}: inconsistent fairness values; keeping first value")
         elif fairness is not None and worker_count < 2:
             warnings.append(f"run {run_id}: fairness omitted (fewer than two valid worker measurements)")
-    return cpu_rows, fairness_by_run, warnings
+    return cpu_rows, fairness_by_run, cgroup_rows, warnings
 
 
 def unique_path(graphs_dir, stem):
@@ -94,7 +107,7 @@ def unique_path(graphs_dir, stem):
             return candidate
 
 
-def save_figures(cpu_rows, fairness_by_run, graphs_dir):
+def save_figures(cpu_rows, fairness_by_run, graphs_dir, cgroup_rows=None):
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -106,6 +119,7 @@ def save_figures(cpu_rows, fairness_by_run, graphs_dir):
         ) from exc
 
     outputs = []
+    cgroup_rows = cgroup_rows or []
     if cpu_rows:
         ordered = sorted(cpu_rows, key=lambda row: (row["run_id"], row["group"], row["worker_id"]))
         height = max(5.5, len(ordered) * 0.28)
@@ -128,6 +142,50 @@ def save_figures(cpu_rows, fairness_by_run, graphs_dir):
                  "Recorded by existing CPU workload runners. This does not compare against the custom scheduler.",
                  fontsize=8)
         path = unique_path(graphs_dir, "cpu_usage")
+        fig.savefig(path, dpi=180, bbox_inches="tight")
+        plt.close(fig)
+        outputs.append(path)
+
+    cgroup_usage = [row for row in cgroup_rows if row["usage"] is not None]
+    if cgroup_usage:
+        ordered = sorted(cgroup_usage, key=lambda row: (row["run_id"], row["group"]))
+        labels = [_cgroup_label(row) for row in ordered]
+        fig, axis = plt.subplots(figsize=(12, max(4.5, len(ordered) * 0.35)), constrained_layout=True)
+        axis.barh(range(len(ordered)), [row["usage"] for row in ordered], color="#70AD47")
+        axis.set_yticks(range(len(ordered)), labels)
+        axis.invert_yaxis()
+        axis.set_xlabel("CPU usage (% of one CPU over workload elapsed time)")
+        axis.set_ylabel("Run identifier | cgroup")
+        axis.set_title("Cgroup CPU usage — default Linux scheduler")
+        axis.grid(axis="x", alpha=0.25)
+        fig.text(0.01, 0.005, "Derived from cpu.stat usage_usec; includes cgroup-level runner overhead.", fontsize=8)
+        path = unique_path(graphs_dir, "cgroup_cpu_usage")
+        fig.savefig(path, dpi=180, bbox_inches="tight")
+        plt.close(fig)
+        outputs.append(path)
+
+    throttled_rows = [row for row in cgroup_rows
+                      if row["throttled_periods"] is not None or row["throttled_time_s"] is not None]
+    if throttled_rows:
+        ordered = sorted(throttled_rows, key=lambda row: (row["run_id"], row["group"]))
+        labels = [_cgroup_label(row) for row in ordered]
+        metrics = []
+        if any(row["throttled_periods"] is not None for row in ordered):
+            metrics.append(("throttled_periods", "Throttled periods (count)"))
+        if any(row["throttled_time_s"] is not None for row in ordered):
+            metrics.append(("throttled_time_s", "Throttled time (seconds)"))
+        fig, axes = plt.subplots(len(metrics), 1, figsize=(12, max(4.5, len(ordered) * 0.32 * len(metrics))),
+                                 squeeze=False, constrained_layout=True)
+        for axis, (key, label) in zip(axes[:, 0], metrics):
+            values = [row[key] if row[key] is not None else float("nan") for row in ordered]
+            axis.barh(range(len(ordered)), values, color="#ED7D31")
+            axis.set_yticks(range(len(ordered)), labels)
+            axis.invert_yaxis()
+            axis.set_xlabel(label)
+            axis.grid(axis="x", alpha=0.25)
+        fig.suptitle("Cgroup CPU throttling — default Linux scheduler")
+        fig.text(0.01, 0.005, "Kernel cpu.stat deltas; unavailable values are omitted. No sched_ext comparison.", fontsize=8)
+        path = unique_path(graphs_dir, "cgroup_throttling")
         fig.savefig(path, dpi=180, bbox_inches="tight")
         plt.close(fig)
         outputs.append(path)
@@ -160,6 +218,15 @@ def save_figures(cpu_rows, fairness_by_run, graphs_dir):
     return outputs
 
 
+def _cgroup_label(row):
+    label = f"{row['run_id']} | {row['group']}"
+    status = row.get("measurement_status", "unknown")
+    exit_status = row.get("exit_status", "NA")
+    if status != "complete" or exit_status not in ("0", 0):
+        label += f" [{status}, exit {exit_status}]"
+    return label
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("inputs", nargs="*", help="analyzer summary CSV file(s)")
@@ -172,16 +239,16 @@ def main(argv=None):
         return 0
 
     records, read_warnings = read_summaries(paths)
-    cpu_rows, fairness_by_run, data_warnings = plot_data(records)
+    cpu_rows, fairness_by_run, cgroup_rows, data_warnings = plot_data(records)
     for warning in read_warnings + data_warnings:
         print(f"Warning: {warning}", file=sys.stderr)
-    if not cpu_rows and not fairness_by_run:
+    if not cpu_rows and not fairness_by_run and not cgroup_rows:
         print("No usable CPU-usage or fairness measurements found; no figures written.", file=sys.stderr)
         return 0
 
     graphs_dir = args.graphs_dir or os.path.join(repo, "graphs")
     try:
-        outputs = save_figures(cpu_rows, fairness_by_run, graphs_dir)
+        outputs = save_figures(cpu_rows, fairness_by_run, graphs_dir, cgroup_rows)
     except PlotDependencyError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
@@ -189,6 +256,11 @@ def main(argv=None):
         print("No usable per-worker CPU-usage measurements; CPU-usage graph skipped.")
     if not fairness_by_run:
         print("No runs with at least two valid CPU-time measurements; fairness graph skipped.")
+    if not any(row["usage"] is not None for row in cgroup_rows):
+        print("No usable cgroup CPU-usage measurements; cgroup CPU-usage graph skipped.")
+    if not any(row["throttled_periods"] is not None or row["throttled_time_s"] is not None
+               for row in cgroup_rows):
+        print("No usable cgroup throttling measurements; throttling graph skipped.")
     for output in outputs:
         print(f"Wrote graph: {output}")
     print("Input measurements describe existing default Linux scheduler runs; no custom scheduler comparison was made.")

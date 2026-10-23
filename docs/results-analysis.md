@@ -1,20 +1,24 @@
 # Results analysis
 
-Analyze recorded group-competition CSV files with the Python 3 standard
-library; no packages are required. From the repository root:
+Analyze existing group-competition and cgroup-competition CSV files with the
+Python 3 standard library; no packages are required. From the repository root:
 
 ```sh
 python3 scripts/analyze_results.py
 python3 scripts/analyze_results.py results/raw/group_competition_*.csv
-python3 scripts/analyze_results.py --output results/processed/group_summary.csv
-python3 scripts/analyze_results.py results/raw/some_run.csv -o results/processed/some_run_summary.csv
+python3 scripts/analyze_results.py results/raw/cgroup_competition_*.csv
+python3 scripts/analyze_results.py results/raw/group_run.csv results/raw/cgroup_run.csv \
+  --output results/processed/combined_summary.csv
 ```
 
-By default, the script reads `results/raw/group_competition_*.csv` and excludes
-the documented incomplete debugging artifact
-`group_competition_20261019T083552Z_LUDraY.csv`. Explicit input paths are
-processed as given. Raw files are only read; an optional output is a separate
-CSV in `results/processed/`.
+By default, the script reads both `results/raw/group_competition_*.csv` and
+`results/raw/cgroup_competition_*.csv`, excluding the documented incomplete
+group debugging artifact `group_competition_20261019T083552Z_LUDraY.csv`.
+Explicit input paths are processed as given. Raw files are read only. The
+optional `--output` writes a derived CSV; if that path already exists, a unique
+suffix is added so an earlier summary is preserved. Group and cgroup rows are
+tagged with `result_type`; cgroup runs are ordinary default Linux scheduler
+experiments and are never labeled as custom sched_ext results.
 
 The analyzer uses the runner's `cpu_time_s` and `elapsed_s` columns. Per-worker
 CPU usage is `cpu_time_s / elapsed_s * 100`; missing, invalid, negative, or
@@ -34,6 +38,32 @@ index is unavailable.
 
 Malformed files and rows are skipped with warnings. Missing or malformed
 measurement fields remain unavailable and do not become invented values.
+
+For cgroup rows, the analyzer recomputes each counter delta from the raw
+`<counter>_before` and `<counter>_after` values. A delta is available only
+when both are unsigned integer counters and the after value is not lower.
+It does not trust a supplied delta when either snapshot is unavailable or
+invalid. `usage_usec_delta` is converted to CPU seconds. `cpu_usage_pct` is
+`100 * usage_usec_delta / 1,000,000 / workload_elapsed_s`, when the elapsed time
+is positive and both snapshots are valid. The cgroup elapsed interval is measured
+around the worker invocation and includes small launch/wait overhead. The
+accounting is cgroup-wide and can include runner overhead; it is not a direct
+worker-only CPU measurement. `nr_throttled_delta` is the number of throttled
+periods and `throttled_usec_delta` is converted to `throttled_time_s`.
+`throttled_period_pct` is `100 * nr_throttled_delta / nr_periods_delta`, only
+when `nr_periods_delta` is positive. Throttling counters are kernel accounting,
+not latency measurements. A nonzero `exit_status` or
+`measurement_status=incomplete` is retained even when some counters are valid;
+only the individual unavailable metrics are omitted. Missing/`NA`, malformed,
+negative, or reset-counter snapshots produce `NA` deltas in the summary. The
+original `measurement_status` and `exit_status` are retained; incomplete runs
+can still have valid individual counter deltas.
+
+The derived cgroup columns are `cpu_time_s`, `elapsed_s`, `cpu_usage_pct`,
+`nr_periods_delta`, `nr_throttled_delta`, `throttled_time_s`,
+`throttled_period_pct`, `exit_status`, `measurement_status`, and
+`cpu_stat_status`. Cgroup rows do not receive a Jain index because two cgroup
+rows are not worker-level measurements of fairness.
 
 ## Plotting analyzed results
 
@@ -55,11 +85,14 @@ python3 scripts/plot_results.py results/processed/group_summary.csv \
   --graphs-dir graphs
 ```
 
-The script can draw a per-worker CPU-usage chart and a per-run Jain index chart
-when those measurements are available. It skips missing or malformed values,
-and omits the fairness graph when a run has fewer than two measured workers.
-Figures are saved under `graphs/` with unique names; existing figures are not
-overwritten. It requires Matplotlib for rendering. If Matplotlib is unavailable,
+The script can draw per-worker CPU-usage and Jain-index charts for group-runner
+summaries, plus separate cgroup CPU-usage and cgroup throttling charts when at
+least one valid measurement for that chart exists. The throttling chart shows throttled-period
+counts and throttled seconds where each is available. It skips missing or
+malformed values, and omits the fairness graph when a run has fewer than two
+measured workers. Cgroup graphs explicitly identify the default Linux
+scheduler and do not compare against sched_ext. Figures use unique names under
+`graphs/`; existing figures are not overwritten. It requires Matplotlib for rendering. If Matplotlib is unavailable,
 the script reports the dependency and leaves the project and input files
 unchanged.
 
@@ -74,11 +107,12 @@ Use `scripts/generate_experiment_report.sh` to run the analyzer and then pass
 its uniquely named summary CSV to the plotter. No workloads are launched:
 
 ```sh
-# Analyze the default results/raw group-competition CSV set and plot it
+# Analyze both default results/raw competition CSV sets and plot them
 bash scripts/generate_experiment_report.sh
 
-# Analyze selected raw CSVs instead
-bash scripts/generate_experiment_report.sh results/raw/run_a.csv results/raw/run_b.csv
+# Analyze selected group and cgroup raw CSVs together
+bash scripts/generate_experiment_report.sh results/raw/group_run.csv \
+  results/raw/cgroup_run.csv
 
 # Choose a different figures directory
 bash scripts/generate_experiment_report.sh \
@@ -91,6 +125,6 @@ The script passes that exact summary file to `plot_results.py`. If there are no
 usable measurements, the plotter says no figures were written. If measurements
 are available but Matplotlib is missing, the plotter reports that dependency
 and the wrapper exits with its error status while preserving the summary.
-The wrapper does not install dependencies. The analyzer and plotter retain
-their existing behavior, including the analyzer's documented exclusion of the
-incomplete debugging artifact when using its default input glob.
+The wrapper does not install dependencies. The analyzer's default input glob
+includes both supported formats and excludes the documented incomplete group
+debugging artifact.
