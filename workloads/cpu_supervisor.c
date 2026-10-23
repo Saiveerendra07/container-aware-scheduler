@@ -4,14 +4,17 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <linux/magic.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <sys/stat.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/resource.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <sys/vfs.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -62,6 +65,178 @@ static int write_all(int fd, const void *buffer, size_t length)
         }
     }
     return 0;
+}
+
+static int open_cgroup_procs(const char *path, int *directory_fd, int *procs_fd)
+{
+    struct stat directory_status;
+    struct statfs filesystem_status;
+
+    *directory_fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (*directory_fd == -1) {
+        return -1;
+    }
+    if (fstat(*directory_fd, &directory_status) == -1) {
+        int saved_errno = errno;
+        close(*directory_fd);
+        *directory_fd = -1;
+        errno = saved_errno;
+        return -1;
+    }
+    if (!S_ISDIR(directory_status.st_mode)) {
+        close(*directory_fd);
+        *directory_fd = -1;
+        errno = ENOTDIR;
+        return -1;
+    }
+#ifndef CPU_SUPERVISOR_TESTING
+    if (fstatfs(*directory_fd, &filesystem_status) == -1) {
+        int saved_errno = errno;
+        close(*directory_fd);
+        *directory_fd = -1;
+        errno = saved_errno;
+        return -1;
+    }
+    if ((unsigned long)filesystem_status.f_type
+        != (unsigned long)CGROUP2_SUPER_MAGIC) {
+        close(*directory_fd);
+        *directory_fd = -1;
+        errno = ENODEV;
+        return -1;
+    }
+#else
+    (void)filesystem_status;
+#endif
+
+    *procs_fd = openat(*directory_fd, "cgroup.procs",
+                       O_WRONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (*procs_fd == -1) {
+        int saved_errno = errno;
+        close(*directory_fd);
+        *directory_fd = -1;
+        errno = saved_errno;
+        return -1;
+    }
+    struct stat procs_status;
+    if (fstat(*procs_fd, &procs_status) == -1) {
+        int saved_errno = errno;
+        close(*procs_fd);
+        close(*directory_fd);
+        *procs_fd = -1;
+        *directory_fd = -1;
+        errno = saved_errno;
+        return -1;
+    }
+    if (!S_ISREG(procs_status.st_mode)) {
+        close(*procs_fd);
+        close(*directory_fd);
+        *procs_fd = -1;
+        *directory_fd = -1;
+        errno = EINVAL;
+        return -1;
+    }
+#ifndef CPU_SUPERVISOR_TESTING
+    if (fstatfs(*procs_fd, &filesystem_status) == -1) {
+        int saved_errno = errno;
+        close(*procs_fd);
+        close(*directory_fd);
+        *procs_fd = -1;
+        *directory_fd = -1;
+        errno = saved_errno;
+        return -1;
+    }
+    if ((unsigned long)filesystem_status.f_type
+        != (unsigned long)CGROUP2_SUPER_MAGIC) {
+        close(*procs_fd);
+        close(*directory_fd);
+        *procs_fd = -1;
+        *directory_fd = -1;
+        errno = ENODEV;
+        return -1;
+    }
+#endif
+    return 0;
+}
+
+static int cgroup_contains_pid(int directory_fd, pid_t pid)
+{
+    int fd = openat(directory_fd, "cgroup.procs",
+                    O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd == -1) {
+        return -1;
+    }
+    FILE *stream = fdopen(fd, "r");
+    if (stream == NULL) {
+        int saved_errno = errno;
+        close(fd);
+        errno = saved_errno;
+        return -1;
+    }
+
+    char *line = NULL;
+    size_t capacity = 0;
+    int found = 0;
+    int failed = 0;
+    while (getline(&line, &capacity, stream) != -1) {
+        char *cursor = line;
+        while (*cursor == ' ' || *cursor == '\t') {
+            cursor++;
+        }
+        errno = 0;
+        char *end = NULL;
+        long value = strtol(cursor, &end, 10);
+        while (end != NULL && (*end == ' ' || *end == '\t'
+                               || *end == '\r' || *end == '\n')) {
+            end++;
+        }
+        if (errno != 0 || end == cursor || end == NULL || *end != '\0'
+            || value <= 0) {
+            failed = 1;
+            errno = EIO;
+            break;
+        }
+        if (value == (long)pid) {
+            found = 1;
+        }
+    }
+    if (ferror(stream)) {
+        failed = 1;
+        if (errno == 0) {
+            errno = EIO;
+        }
+    }
+    int saved_errno = errno;
+    free(line);
+    if (fclose(stream) == EOF && !failed) {
+        failed = 1;
+        saved_errno = errno;
+    }
+    if (failed) {
+        errno = saved_errno;
+        return -1;
+    }
+    return found;
+}
+
+static int place_child_in_cgroup(int directory_fd, int procs_fd, pid_t pid)
+{
+    char pid_line[32];
+    int length = snprintf(pid_line, sizeof(pid_line), "%ld\n", (long)pid);
+    if (length < 0 || (size_t)length >= sizeof(pid_line)) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    if (write_all(procs_fd, pid_line, (size_t)length) == -1) {
+        return -1;
+    }
+    int present = cgroup_contains_pid(directory_fd, pid);
+    if (present == 1) {
+        return 0;
+    }
+    if (present == 0) {
+        errno = EIO;
+    }
+    return -1;
 }
 
 static uint64_t timeval_to_microseconds(const struct timeval *value)
@@ -488,18 +663,25 @@ static int wait_for_worker(pid_t worker_pid,
 
 int main(int argc, char **argv)
 {
-    if (argc != 5) {
+    int placement_mode = argc == 7 && strcmp(argv[1], "--cgroup") == 0;
+    if (argc != 5 && !placement_mode) {
         fprintf(stderr,
-                "Usage: %s metadata_path worker_path duration_seconds cancel_path\n",
+                "Usage: %s [--cgroup CGROUP_DIRECTORY] metadata_path "
+                "worker_path duration_seconds cancel_path\n",
                 argv[0]);
         return 2;
     }
 
-    const char *metadata_path = argv[1];
-    const char *worker_path = argv[2];
-    const char *duration = argv[3];
-    const char *cancel_path = argv[4];
+    const char *cgroup_path = placement_mode ? argv[2] : NULL;
+    int argument_offset = placement_mode ? 2 : 0;
+    const char *metadata_path = argv[1 + argument_offset];
+    const char *worker_path = argv[2 + argument_offset];
+    const char *duration = argv[3 + argument_offset];
+    const char *cancel_path = argv[4 + argument_offset];
     int exec_pipe[2];
+    int release_pipe[2] = {-1, -1};
+    int cgroup_directory_fd = -1;
+    int cgroup_procs_fd = -1;
 
     if (pipe(exec_pipe) == -1) {
         int error_number = errno;
@@ -563,11 +745,43 @@ int main(int argc, char **argv)
         return 125;
     }
 
+    if (placement_mode) {
+        if (open_cgroup_procs(cgroup_path, &cgroup_directory_fd,
+                              &cgroup_procs_fd) == -1) {
+            int error_number = errno;
+            close(exec_pipe[0]);
+            close(exec_pipe[1]);
+            (void)sigprocmask(SIG_SETMASK, &original_mask, NULL);
+            (void)write_failure_metadata(metadata_path, error_number);
+            fprintf(stderr, "cpu_supervisor: cgroup %s: %s\n", cgroup_path,
+                    strerror(error_number));
+            return 125;
+        }
+        if (pipe(release_pipe) == -1) {
+            int error_number = errno;
+            close(exec_pipe[0]);
+            close(exec_pipe[1]);
+            close(cgroup_procs_fd);
+            close(cgroup_directory_fd);
+            (void)sigprocmask(SIG_SETMASK, &original_mask, NULL);
+            (void)write_failure_metadata(metadata_path, error_number);
+            fprintf(stderr, "cpu_supervisor: release pipe: %s\n",
+                    strerror(error_number));
+            return 125;
+        }
+    }
+
     pid_t worker_pid = fork();
     if (worker_pid == -1) {
         int error_number = errno;
         close(exec_pipe[0]);
         close(exec_pipe[1]);
+        if (placement_mode) {
+            close(release_pipe[0]);
+            close(release_pipe[1]);
+            close(cgroup_procs_fd);
+            close(cgroup_directory_fd);
+        }
         (void)sigprocmask(SIG_SETMASK, &original_mask, NULL);
         (void)write_failure_metadata(metadata_path, error_number);
         fprintf(stderr, "cpu_supervisor: fork: %s\n", strerror(error_number));
@@ -576,6 +790,11 @@ int main(int argc, char **argv)
 
     if (worker_pid == 0) {
         close(exec_pipe[0]);
+        if (placement_mode) {
+            close(release_pipe[1]);
+            close(cgroup_procs_fd);
+            close(cgroup_directory_fd);
+        }
 
         struct sigaction default_action;
         memset(&default_action, 0, sizeof(default_action));
@@ -592,6 +811,18 @@ int main(int argc, char **argv)
             _exit(125);
         }
 
+        if (placement_mode) {
+            char release = '\0';
+            ssize_t amount;
+            do {
+                amount = read(release_pipe[0], &release, 1);
+            } while (amount == -1 && errno == EINTR);
+            close(release_pipe[0]);
+            if (amount != 1 || release != 'R') {
+                _exit(125);
+            }
+        }
+
         char *const worker_argv[] = {
             (char *)worker_path,
             (char *)duration,
@@ -605,6 +836,9 @@ int main(int argc, char **argv)
     }
 
     close(exec_pipe[1]);
+    if (placement_mode) {
+        close(release_pipe[0]);
+    }
     int worker_group_ready = 1;
     int supervisor_errno = 0;
     if (setpgid(worker_pid, worker_pid) == -1
@@ -613,6 +847,71 @@ int main(int argc, char **argv)
         supervisor_errno = errno;
     }
     int initial_signal = 0;
+
+    if (placement_mode) {
+        int placement_error = 0;
+        if (worker_group_ready
+            && place_child_in_cgroup(cgroup_directory_fd, cgroup_procs_fd,
+                                     worker_pid) == -1) {
+            placement_error = errno;
+        } else if (!worker_group_ready) {
+            placement_error = supervisor_errno != 0 ? supervisor_errno : EIO;
+        } else if (caught_signal != 0) {
+            placement_error = EINTR;
+        }
+        close(cgroup_procs_fd);
+        close(cgroup_directory_fd);
+        cgroup_procs_fd = -1;
+        cgroup_directory_fd = -1;
+        if (placement_error != 0) {
+            close(release_pipe[1]);
+            release_pipe[1] = -1;
+            struct rusage ignored_usage;
+            int ignored_status;
+            int wait_error = 0;
+            (void)wait_for_worker(worker_pid, &ignored_status, &ignored_usage,
+                                  &wait_error, cancel_path, SIGTERM,
+                                  worker_group_ready);
+            (void)write_failure_metadata(metadata_path, placement_error);
+            fprintf(stderr, "cpu_supervisor: cgroup placement/verification: %s\n",
+                    strerror(placement_error));
+            return 125;
+        }
+        const char release = 'R';
+        struct sigaction ignore_sigpipe;
+        memset(&ignore_sigpipe, 0, sizeof(ignore_sigpipe));
+        ignore_sigpipe.sa_handler = SIG_IGN;
+        sigemptyset(&ignore_sigpipe.sa_mask);
+        if (sigaction(SIGPIPE, &ignore_sigpipe, NULL) == -1) {
+            int error_number = errno;
+            close(release_pipe[1]);
+            struct rusage ignored_usage;
+            int ignored_status;
+            int wait_error = 0;
+            (void)wait_for_worker(worker_pid, &ignored_status, &ignored_usage,
+                                  &wait_error, cancel_path, SIGTERM,
+                                  worker_group_ready);
+            (void)write_failure_metadata(metadata_path, error_number);
+            fprintf(stderr, "cpu_supervisor: configure release pipe: %s\n",
+                    strerror(error_number));
+            return 125;
+        }
+        if (write_all(release_pipe[1], &release, 1) == -1) {
+            int error_number = errno;
+            close(release_pipe[1]);
+            struct rusage ignored_usage;
+            int ignored_status;
+            int wait_error = 0;
+            (void)wait_for_worker(worker_pid, &ignored_status, &ignored_usage,
+                                  &wait_error, cancel_path, SIGTERM,
+                                  worker_group_ready);
+            (void)write_failure_metadata(metadata_path, error_number);
+            fprintf(stderr, "cpu_supervisor: release worker: %s\n",
+                    strerror(error_number));
+            return 125;
+        }
+        close(release_pipe[1]);
+    }
     if (sigprocmask(SIG_SETMASK, &original_mask, NULL) == -1) {
         /* Keep the child owned and reapable even if unblocking fails. */
         int error_number = errno;

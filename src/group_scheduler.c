@@ -201,14 +201,26 @@ int main(int argc, char **argv)
 		link = NULL;
 		goto out;
 	}
+	/* The experiment runner waits for this exact line before releasing workers. */
+	if (puts("GROUP_SCHEDULER_ATTACHED") == EOF || fflush(stdout) == EOF) {
+		fprintf(stderr, "Failed to report scheduler attachment readiness\n");
+		goto out;
+	}
 
 	while (!exit_requested && !UEI_EXITED(skel, uei))
 		sleep(1);
 
 	ret = EXIT_SUCCESS;
 out:
-	if (link)
-		bpf_link__destroy(link);
+	if (link) {
+		int destroy_error = bpf_link__destroy(link);
+
+		if (destroy_error) {
+			fprintf(stderr, "Failed to destroy scheduler link: %s\n",
+				strerror(-destroy_error));
+			ret = EXIT_FAILURE;
+		}
+	}
 	if (skel && skel->data && UEI_EXITED(skel, uei)) {
 		exit_code = UEI_REPORT(skel, uei);
 		if (exit_code)

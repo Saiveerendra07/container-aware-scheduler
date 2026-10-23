@@ -32,9 +32,11 @@ USER_CFLAGS := -std=gnu11 -Wall -Wextra -Werror -Iinclude \
 	-I$(BUILD_DIR) -isystem $(SCX_INCLUDE) $(LIBBPF_CFLAGS)
 USER_LIBS := $(LIBBPF_LIBS) -lelf -lz -lzstd -lpthread
 
-.PHONY: all clean check-deps
+.PHONY: all workloads clean check-deps
 
 all: $(BUILD_DIR)/group_scheduler
+
+workloads: $(BUILD_DIR)/cpu_worker $(BUILD_DIR)/cpu_supervisor
 
 check-deps:
 	@$(PKG_CONFIG) --atleast-version=1.5 libbpf || { \
@@ -71,6 +73,12 @@ $(BUILD_DIR)/group_scheduler.skel.h: $(BUILD_DIR)/group_scheduler.bpf.o
 $(BUILD_DIR)/group_scheduler: src/group_scheduler.c \
 		include/group_scheduler.h $(BUILD_DIR)/group_scheduler.skel.h | check-deps
 	$(CC) $(USER_CFLAGS) "$<" -o "$@" $(USER_LIBS)
+
+$(BUILD_DIR)/cpu_worker: workloads/cpu_worker.c | $(BUILD_DIR)
+	$(CC) -O2 -Wall -Wextra -Werror -std=c11 "$<" -o "$@"
+
+$(BUILD_DIR)/cpu_supervisor: workloads/cpu_supervisor.c | $(BUILD_DIR)
+	$(CC) -O2 -Wall -Wextra -Werror -std=c11 "$<" -o "$@"
 
 clean:
 	@if [ "$(abspath $(BUILD_DIR))" != "$(CURDIR)/build" ]; then \

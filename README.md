@@ -69,6 +69,11 @@ and careful control of other CPU limits and system load.
   throttling summaries for cgroup runs. `scripts/plot_results.py` produces
   separate group-runner and cgroup measurement graphs when valid data exists
   (Matplotlib is needed to render figures).
+- **Weighted fairness evaluation:** `scripts/evaluate_fairness.py` compares
+  observed group CPU-time percentages with recorded relative shares and
+  reports a separate equality-based Jain index. Current cgroup CSVs support
+  `cpu.weight` comparison; existing group CSVs lack share values and cannot
+  support weighted allocation error without added share metadata.
 - **Experiment suite and report generator:**
   `scripts/run_experiment_suite.sh` repeats the existing baseline and CPU
   competition runners and records a manifest. Its `--dry-run` option previews
@@ -251,6 +256,25 @@ bash scripts/generate_experiment_report.sh \
   --graphs-dir graphs results/raw/group_competition_RUN.csv
 ```
 
+### Evaluate weighted group allocation
+
+After collecting cgroup `cpu.weight` results, calculate observed and expected
+group CPU shares and write a new evaluation CSV:
+
+```sh
+python3 scripts/evaluate_fairness.py results/raw/cgroup_competition_*.csv \
+  --output results/processed/fairness.csv
+```
+
+The evaluator computes signed allocation error in percentage points and a
+separate Jain index for equality among measured groups. A 2:1 allocation can
+match 2:1 configured shares exactly while having Jain index 0.9; equal Jain
+fairness is not the goal when configured shares differ. It refuses to
+overwrite input or existing files. See
+[`docs/fairness-evaluation.md`](docs/fairness-evaluation.md) for supported
+schemas, exclusions, and output fields. Synthetic test data is confined to
+temporary unit-test files and is never mixed with experiment results.
+
 ### Custom scheduler build and future runtime evaluation
 
 Build the loader only on a machine with the required BPF, libbpf, BTF, and
@@ -384,3 +408,37 @@ explicitly selected delegated subtree and should be started deliberately.
 Loading the custom scheduler requires an explicit invocation, a compatible
 kernel, suitable privileges, prepared cgroups, and a recovery plan. No build,
 test, or report command in this README automatically attaches it.
+## Custom scheduler experiments
+
+The custom-scheduler harness has explicit `prepare`, `check`, and `run` modes.
+`prepare` writes unique manifest/CSV files without attaching or starting
+workloads:
+
+```sh
+python3 scripts/run_custom_scheduler_experiment.py prepare --duration 10 \
+  --fallback-share 100 \
+  --group latency:12345:100:/sys/fs/cgroup/test/latency \
+  --group batch:12346:300:/sys/fs/cgroup/test/batch
+```
+
+Obtain each expected ID with
+`python3 scripts/prepare_custom_scheduler_experiment.py --identify-cgroup PATH`;
+the harness independently verifies every ID/path pair before writing files.
+Use `make` and `make workloads`, then run the read-only prerequisite check:
+
+```sh
+python3 scripts/run_custom_scheduler_experiment.py check --duration 10 \
+  --fallback-share 100 \
+  --group latency:12345:100:/sys/fs/cgroup/test/latency \
+  --group batch:12346:300:/sys/fs/cgroup/test/batch
+```
+
+Only the explicit `run` subcommand attempts attachment and workload launch.
+It requires a compatible sched_ext kernel, usable BTF/libbpf-built artifacts,
+attach permissions, verified writable cgroups, and a recovery plan. It records
+custom scheduler shares separately from cgroup `cpu.weight` and `cpu.max`.
+Attachment failure aborts without starting workers or falling back to ordinary
+Linux scheduling. No runtime success is claimed here; mocked tests do not
+validate kernel attachment or shutdown. See
+[`docs/custom-scheduler-experiments.md`](docs/custom-scheduler-experiments.md)
+for exact run invocation, readiness/shutdown behavior, schema, and limits.

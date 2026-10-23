@@ -36,6 +36,12 @@ usable CPU time can contribute; the summary reports how many measurements
 were included. If there are no valid CPU-time values or all are zero, the
 index is unavailable.
 
+This per-worker Jain index measures equality and is not a comparison against
+configured group weights. Use [`fairness-evaluation.md`](fairness-evaluation.md)
+and `scripts/evaluate_fairness.py` for weighted group allocation when the raw
+CSV records explicit shares. Existing group-runner `group_counts` are worker
+counts and are not treated as shares.
+
 Malformed files and rows are skipped with warnings. Missing or malformed
 measurement fields remain unavailable and do not become invented values.
 
