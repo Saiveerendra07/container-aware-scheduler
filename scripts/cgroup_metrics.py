@@ -11,7 +11,7 @@ COUNTERS = (
     "nr_throttled", "throttled_usec",
 )
 METADATA_COLUMNS = (
-    "run_id", "timestamp_utc", "kernel_version", "logical_cpu_count",
+    "run_id", "timestamp_utc", "kernel_version", "logical_cpu_count", "architecture",
     "requested_duration_s", "control_setting", "group", "cgroup_path",
     "workload_elapsed_s", "exit_status", "measurement_status",
 )
@@ -68,9 +68,9 @@ def counter_delta(before, after, key):
 
 
 def row_from_metadata(metadata):
-    before = read_cpu_stat(metadata[11])
-    after = read_cpu_stat(metadata[12])
-    row = dict(zip(METADATA_COLUMNS, metadata[:11]))
+    before = read_cpu_stat(metadata[12])
+    after = read_cpu_stat(metadata[13])
+    row = dict(zip(METADATA_COLUMNS, metadata[:12]))
     available = 0
     for counter in COUNTERS:
         first = before.get(counter)
@@ -96,8 +96,8 @@ def write_csv(metadata_path, output_path):
         writer = csv.DictWriter(target, fieldnames=COLUMNS)
         writer.writeheader()
         for line_number, metadata in enumerate(reader, start=1):
-            if len(metadata) != 13:
-                raise ValueError(f"metadata row {line_number} has {len(metadata)} columns; expected 13")
+            if len(metadata) != 14:
+                raise ValueError(f"metadata row {line_number} has {len(metadata)} columns; expected 14")
             writer.writerow(row_from_metadata(metadata))
 
 

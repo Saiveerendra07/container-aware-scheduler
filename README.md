@@ -74,6 +74,10 @@ and careful control of other CPU limits and system load.
   reports a separate equality-based Jain index. Current cgroup CSVs support
   `cpu.weight` comparison; existing group CSVs lack share values and cannot
   support weighted allocation error without added share metadata.
+- **Repeated-run summaries:** `scripts/summarize_repeated_runs.py` groups
+  compatible completed runs and reports descriptive metric statistics plus
+  exclusion reasons. It preserves unavailable measurements and does not infer
+  statistical significance.
 - **Experiment suite and report generator:**
   `scripts/run_experiment_suite.sh` repeats the existing baseline and CPU
   competition runners and records a manifest. Its `--dry-run` option previews
@@ -275,6 +279,26 @@ overwrite input or existing files. See
 schemas, exclusions, and output fields. Synthetic test data is confined to
 temporary unit-test files and is never mixed with experiment results.
 
+### Summarize repeated runs
+
+Generate unique CSV and Markdown summaries from compatible completed runs:
+
+```sh
+python3 scripts/summarize_repeated_runs.py \
+  results/raw/group_competition_*.csv \
+  results/raw/cgroup_competition_*.csv \
+  results/raw/custom_scheduler_run_*.csv \
+  --output-dir results/processed/repeated
+```
+
+Each configuration is summarized separately. The report includes mean,
+median, sample standard deviation, and per-metric sample count for available
+CPU time, CPU usage, elapsed time, cgroup throttling, Jain fairness, and
+share-weighted allocation error. Add `--repeated-summary` to
+`generate_experiment_report.sh` to include these outputs in its report
+directory. See [`docs/results-analysis.md`](docs/results-analysis.md) for the
+aggregation rules, exclusions, and limits.
+
 ### Custom scheduler build and future runtime evaluation
 
 Build the loader only on a machine with the required BPF, libbpf, BTF, and
@@ -412,7 +436,9 @@ test, or report command in this README automatically attaches it.
 
 The custom-scheduler harness has explicit `prepare`, `check`, and `run` modes.
 `prepare` writes unique manifest/CSV files without attaching or starting
-workloads:
+workloads. All three modes validate 2 to 8 unique cgroup identities, each
+configured share and fallback share in 1..10000, and the loader's combined
+share limit:
 
 ```sh
 python3 scripts/run_custom_scheduler_experiment.py prepare --duration 10 \
@@ -437,6 +463,9 @@ Only the explicit `run` subcommand attempts attachment and workload launch.
 It requires a compatible sched_ext kernel, usable BTF/libbpf-built artifacts,
 attach permissions, verified writable cgroups, and a recovery plan. It records
 custom scheduler shares separately from cgroup `cpu.weight` and `cpu.max`.
+Completed raw run CSVs can be passed directly to
+`scripts/evaluate_fairness.py`; prepared and incomplete runs retain unavailable
+measurements and are excluded from allocation comparisons.
 Attachment failure aborts without starting workers or falling back to ordinary
 Linux scheduling. No runtime success is claimed here; mocked tests do not
 validate kernel attachment or shutdown. See

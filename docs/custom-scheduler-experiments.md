@@ -19,7 +19,10 @@ python3 scripts/prepare_custom_scheduler_experiment.py \
 
 It prints JSON with the resolved path, kernel ID, cgroup2 mount ID, and
 verification method. Copy each returned ID into the experiment command.
-Prepare a manifest and `not_run_prepared` CSV without starting anything:
+Prepare a manifest and `not_run_prepared` CSV without starting anything. The
+preparation utility accepts 2 to 8 configured groups, matching the loader, and
+validates each share and cgroup ID against the same integer ranges used by the
+run path:
 
 ```sh
 python3 scripts/run_custom_scheduler_experiment.py prepare --duration 10 \
@@ -95,7 +98,10 @@ not use this on an untested production host.
 
 The loader checks `bpf_link__destroy()` and returns failure if libbpf reports
 a detach error. The runner then marks the result incomplete. A failing detach
-status is surfaced; it is not reported as a successful shutdown.
+status is surfaced with the loader's exit code in the manifest; it is not
+reported as a successful shutdown. Loader readiness is read from a fresh pipe
+for every invocation, including partial output, and each run reserves new CSV,
+manifest, and log paths so stale readiness or prior results cannot be reused.
 
 If the loader exits unexpectedly after attachment, the runner stops the
 supervisors and marks every group measurement incomplete so the fairness
@@ -117,8 +123,10 @@ python3 scripts/evaluate_fairness.py results/raw/custom_scheduler_run.csv \
 Placement requires cgroup v2, a delegated target cgroup, and permission to
 write its `cgroup.procs`. The harness never enables controllers or changes
 cgroup controls. The old supervisor invocation remains backward-compatible.
-Unit tests use mocked/synthetic inputs and do not validate real kernel cgroup
-migration, sched_ext attachment, weighted runtime behavior, or teardown.
+Unit tests use controlled fake loader/supervisor processes and synthetic inputs.
+They check process cleanup, result invalidation, unique outputs, and attach
+timeouts, but do not validate real kernel cgroup migration, sched_ext
+attachment, weighted runtime behavior, or teardown.
 No runtime success is claimed until a supported sched_ext host has run the
 explicit command above and retained the raw output.
 

@@ -154,7 +154,7 @@ finalize_results() {
         [[ -n $group_summary ]] && group_summary+=";"
         group_summary+="${group_names[i]}=${group_counts[i]}"
     done
-    printf '%s\n' 'run_id,timestamp_utc,kernel_version,logical_cpu_count,requested_duration_s,group_counts,worker_id,group,group_worker_index,supervisor_pid,worker_pid,user_cpu_s,system_cpu_s,cpu_time_s,elapsed_s,iterations,exit_status,termination_signal,measurement_status,output_log' >"$result_file"
+    printf '%s\n' 'run_id,timestamp_utc,kernel_version,logical_cpu_count,architecture,requested_duration_s,group_counts,worker_id,group,group_worker_index,supervisor_pid,worker_pid,user_cpu_s,system_cpu_s,cpu_time_s,elapsed_s,iterations,exit_status,termination_signal,measurement_status,output_log' >"$result_file"
     index=0
     for ((i=0; i<${#group_names[@]}; i++)); do
         count=${group_counts[i]}
@@ -200,7 +200,7 @@ finalize_results() {
             [[ -n $exit_field ]] || exit_field=NA
             [[ -n $pid_field ]] || pid_field=NA
             append_csv_row "$run_id" "$timestamp" "$(uname -r)" "$(getconf _NPROCESSORS_ONLN)" \
-                "$duration" "$group_summary" "${worker_ids[index]}" "${worker_groups[index]}" \
+                "$(uname -m)" "$duration" "$group_summary" "${worker_ids[index]}" "${worker_groups[index]}" \
                 "${worker_indexes[index]}" "$sup_pid" "$pid_field" "$user_s" "$system_s" "$cpu_s" \
                 "$elapsed_worker" "$iterations" "$exit_field" "$META_SIGNAL" "$status_text" "${worker_logs[index]:-NA}"
             if [[ $exit_field != 0 || $META_SIGNAL != 0 || $status_text == launch_failed || $status_text == supervisor_error || $status_text == exec_failed ]]; then

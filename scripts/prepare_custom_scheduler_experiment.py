@@ -14,6 +14,7 @@ from pathlib import Path
 
 
 MAX_SHARE = 10000
+MAX_GROUPS = 8
 MAX_CGROUP_ID = (1 << 64) - 1
 FILEID_KERNFS = 0xFE
 KERNFS_HANDLE_BYTES = 8
@@ -183,8 +184,8 @@ def prepare(groups, output_dir, duration):
     names = [group["name"] for group in groups]
     ids = [group["cgroup_id"] for group in groups]
     paths = [str(Path(group["path"]).resolve(strict=True)) for group in groups]
-    if len(groups) < 2:
-        raise ValueError("at least two groups are required")
+    if not 2 <= len(groups) <= MAX_GROUPS:
+        raise ValueError(f"scheduler requires 2 to {MAX_GROUPS} configured groups")
     if len(set(names)) != len(names):
         raise ValueError("group names must be unique")
     if len(set(ids)) != len(ids):

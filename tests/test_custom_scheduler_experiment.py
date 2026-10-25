@@ -15,6 +15,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 EVALUATE = ROOT / "scripts" / "evaluate_fairness.py"
 PREPARER = ROOT / "scripts" / "prepare_custom_scheduler_experiment.py"
+RUNNER = ROOT / "scripts" / "run_custom_scheduler_experiment.py"
 
 
 def load_evaluator():
@@ -27,6 +28,14 @@ def load_evaluator():
 def load_preparer():
     spec = importlib.util.spec_from_file_location("custom_experiment_preparer", PREPARER)
     module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_runner():
+    spec = importlib.util.spec_from_file_location("custom_scheduler_runner", RUNNER)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
 
@@ -175,6 +184,37 @@ class CustomSchedulerExperimentTests(unittest.TestCase):
                         f"lost:{1 << 64}:100:{one}"):
                 with self.assertRaises(preparer.argparse.ArgumentTypeError):
                     preparer.parse_group(bad)
+
+    def test_preparation_enforces_loader_group_limit(self):
+        preparer = load_preparer()
+        with tempfile.TemporaryDirectory(prefix="synthetic_test_only_") as temp:
+            root = Path(temp)
+            groups = []
+            for index in range(9):
+                path = root / f"group{index}"
+                path.mkdir()
+                groups.append({"name": f"g{index}", "cgroup_id": index + 1,
+                               "share": 1, "path": str(path)})
+            with self.assertRaisesRegex(ValueError, "2 to 8"):
+                preparer.prepare(groups, root / "out", 1)
+
+    def test_runner_rejects_non_integer_and_out_of_range_config_values(self):
+        runner = load_runner()
+        with tempfile.TemporaryDirectory(prefix="synthetic_test_only_") as temp:
+            root = Path(temp)
+            groups = []
+            for name, cgroup_id in (("alpha", 101), ("beta", 202)):
+                path = root / name
+                path.mkdir()
+                groups.append({"name": name, "cgroup_id": cgroup_id,
+                               "share": 100, "path": str(path)})
+            for invalid_groups, fallback in (
+                ([dict(groups[0], share=True), groups[1]], 50),
+                ([dict(groups[0], cgroup_id=1 << 64), groups[1]], 50),
+                (groups, True),
+            ):
+                with self.assertRaises(runner.ExperimentError):
+                    runner.validate_groups(invalid_groups, fallback)
 
     def test_synthetic_completed_harness_schema_is_accepted_end_to_end(self):
         with tempfile.TemporaryDirectory(prefix="synthetic_test_only_") as temp:

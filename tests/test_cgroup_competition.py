@@ -74,7 +74,7 @@ class CgroupCompetitionTests(unittest.TestCase):
             metadata = os.path.join(directory, "metadata.tsv")
             output = os.path.join(directory, "result.csv")
             with open(metadata, "w", encoding="utf-8") as stream:
-                stream.write("run\ttime\tkernel\t2\t1\tcpu.weight A=100 B=100\tA\t/tmp/a\tNA\tNA\tincomplete\tNA\tNA\n")
+                stream.write("run\ttime\tkernel\t2\tx86_64\t1\tcpu.weight A=100 B=100\tA\t/tmp/a\tNA\tNA\tincomplete\tNA\tNA\n")
             write_csv(metadata, output)
             with open(output, newline="", encoding="utf-8") as stream:
                 reader = csv.DictReader(stream)
@@ -100,7 +100,7 @@ class CgroupCompetitionTests(unittest.TestCase):
                 stream.write("nr_throttled 2\nthrottled_usec 9\n")
             with open(metadata, "w", encoding="utf-8") as stream:
                 stream.write(
-                    f"run\ttime\tkernel\t2\t1\tcpu.max A=50000/100000 B=100000/100000"
+                    f"run\ttime\tkernel\t2\tx86_64\t1\tcpu.max A=50000/100000 B=100000/100000"
                     f"\tA\t/tmp/a\t1.00\t0\tcomplete\t{before}\t{after}\n"
                 )
             write_csv(metadata, output)

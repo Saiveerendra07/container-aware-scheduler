@@ -42,6 +42,7 @@ class GenerateExperimentReportTests(unittest.TestCase):
             result = self.run_report(
                 "--processed-dir", processed,
                 "--graphs-dir", graphs,
+                "--repeated-summary",
                 raw,
             )
 
@@ -54,6 +55,27 @@ class GenerateExperimentReportTests(unittest.TestCase):
             self.assertEqual(len(summaries), 1)
             self.assertFalse(os.path.exists(graphs))
             self.assertIn(summaries[0], result.stdout)
+            self.assertEqual(len([name for _, _, files in os.walk(processed) for name in files
+                                  if name.startswith("repeated_run_summary_") and name.endswith(".csv")]), 1)
+            self.assertEqual(len([name for _, _, files in os.walk(processed) for name in files
+                                  if name.startswith("repeated_run_summary_") and name.endswith(".md")]), 1)
+
+    def test_legacy_workflow_without_repeated_summary_flag(self):
+        columns = ["run_id", "timestamp_utc", "kernel_version", "logical_cpu_count",
+                   "requested_duration_s", "group_counts", "worker_id", "group",
+                   "group_worker_index", "supervisor_pid", "worker_pid", "user_cpu_s",
+                   "system_cpu_s", "cpu_time_s", "elapsed_s", "iterations", "exit_status",
+                   "termination_signal", "measurement_status", "output_log"]
+        with tempfile.TemporaryDirectory() as directory:
+            raw = os.path.join(directory, "empty.csv")
+            processed = os.path.join(directory, "processed")
+            with open(raw, "w", newline="") as stream:
+                csv.writer(stream).writerow(columns)
+            result = self.run_report("--processed-dir", processed, raw)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            files = [name for _, _, names in os.walk(processed) for name in names]
+            self.assertIn("analyzed_results.csv", files)
+            self.assertFalse(any(name.startswith("repeated_run_summary_") for name in files))
 
 
 if __name__ == "__main__":

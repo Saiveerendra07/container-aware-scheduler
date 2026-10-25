@@ -30,6 +30,9 @@ python3 scripts/evaluate_fairness.py results/raw/custom_group_run.csv \
   --output results/processed/custom_group_fairness.csv
 ```
 
+The custom scheduler runner also writes `group_share` on each raw result row,
+so completed custom scheduler CSVs can be evaluated directly with this tool.
+
 The repository's existing group runner records `group_counts`, which are
 worker counts, not configured shares. That format can still supply observed
 group CPU percentages and Jain's equality index, but weighted expected shares
@@ -37,10 +40,12 @@ and allocation errors are reported as `NA`. The cgroup result file supports
 weighted comparison for `cpu.weight`; `cpu.max` expresses quotas rather than
 relative shares and is not converted into an expected allocation. The
 analyzer's processed cgroup summary omits before/after snapshots, so pass the
-raw cgroup CSV to this tool. No format in the repository currently records
-the custom sched_ext loader's configured shares alongside scheduler CPU-time
-measurements; a custom scheduler evaluation therefore needs a result CSV that
-includes explicit share metadata.
+raw cgroup CSV to this tool. The custom sched_ext runner records configured
+shares and CPU-time measurements in the schema accepted here. Its `prepare`
+output is excluded because it is not a run, and an incomplete `run` is excluded
+because its measurement status is not complete. Use `scripts/analyze_results.py`
+for the repository's group/cgroup competition schemas; use this evaluator for
+share-weighted custom-scheduler allocation analysis.
 With only per-row share columns, the evaluator can identify configured groups
 that have no measurement only if the CSV also includes a complete
 `group_shares` / `configured_group_shares` mapping. Otherwise the configured

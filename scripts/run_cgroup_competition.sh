@@ -121,7 +121,7 @@ run_id=${run_id%.csv}
 tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/cgroup_metrics_${BASHPID}_XXXXXX")
 metadata_file="$tmp_dir/metadata.tsv"
 metrics_helper="$script_dir/cgroup_metrics.py"
-printf 'run_id\ttimestamp_utc\tkernel_version\tlogical_cpu_count\trequested_duration_s\tcontrol_setting\tgroup\tcgroup_path\tworkload_elapsed_s\texit_status\tmeasurement_status\tbefore_stat\tafter_stat\n' >"$metadata_file"
+printf 'run_id\ttimestamp_utc\tkernel_version\tlogical_cpu_count\tarchitecture\trequested_duration_s\tcontrol_setting\tgroup\tcgroup_path\tworkload_elapsed_s\texit_status\tmeasurement_status\tbefore_stat\tafter_stat\n' >"$metadata_file"
 created=()
 pids=()
 groups=("$group_a" "$group_b")
@@ -133,6 +133,7 @@ worker_statuses=(NA NA)
 run_timestamp=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 kernel_version=$(uname -r)
 logical_cpu_count=$(getconf _NPROCESSORS_ONLN)
+architecture=$(uname -m)
 setting=
 if [[ -n $weight_a ]]; then setting="cpu.weight A=$weight_a B=$weight_b"
 else setting="cpu.max A=$quota_a B=$quota_b"; fi
@@ -168,8 +169,8 @@ cleanup() {
         fi
         [[ $worker_status =~ ^[0-9]+$ ]] || worker_status=NA
         [[ $measure_status == complete && $worker_status == 0 ]] || measure_status=incomplete
-        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-            "$run_id" "$run_timestamp" "$kernel_version" "$logical_cpu_count" "$duration" \
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$run_id" "$run_timestamp" "$kernel_version" "$logical_cpu_count" "$architecture" "$duration" \
             "$setting" "${group_names[index]}" "${groups[index]}" "$elapsed" "$worker_status" \
             "$measure_status" "${before_files[index]}" "${after_files[index]}" >>"$metadata_file"
     done

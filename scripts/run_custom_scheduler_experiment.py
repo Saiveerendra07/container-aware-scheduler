@@ -5,6 +5,7 @@ import argparse
 import csv
 import json
 import os
+import platform
 import selectors
 import signal
 import subprocess
@@ -22,6 +23,7 @@ import prepare_custom_scheduler_experiment as preparation
 READY_LINE = "GROUP_SCHEDULER_ATTACHED"
 RESULT_FIELDS = [
     "run_id", "timestamp_utc", "group", "cgroup_id", "cgroup_path",
+    "kernel_version", "logical_cpu_count", "architecture", "worker_executable",
     "verified_cgroup_id", "identity_verification_status",
     "identity_verification_method", "cgroup_mount_id", "cgroup_filesystem", "group_share",
     "fallback_share", "share_source", "cgroup_cpu_weight", "cgroup_cpu_max",
@@ -70,9 +72,15 @@ def build_parser():
 def validate_groups(groups, fallback_share):
     if len(groups) < 2 or len(groups) > 8:
         raise ExperimentError("scheduler requires 2 to 8 configured groups")
-    if not 1 <= fallback_share <= preparation.MAX_SHARE:
+    if type(fallback_share) is not int or not 1 <= fallback_share <= preparation.MAX_SHARE:
         raise ExperimentError("fallback share must be from 1 to 10000")
-    if len(groups) + 1 > 9 or sum(g["share"] for g in groups) + fallback_share > 9 * 10000:
+    for group in groups:
+        if (type(group.get("cgroup_id")) is not int
+                or not 0 < group["cgroup_id"] <= preparation.MAX_CGROUP_ID
+                or type(group.get("share")) is not int
+                or not 0 < group["share"] <= preparation.MAX_SHARE):
+            raise ExperimentError("cgroup IDs and shares must be valid positive integers")
+    if sum(g["share"] for g in groups) + fallback_share > 9 * preparation.MAX_SHARE:
         raise ExperimentError("combined scheduler shares exceed the loader's supported total")
     names = [g["name"] for g in groups]
     ids = [g["cgroup_id"] for g in groups]
@@ -201,11 +209,14 @@ def _manifest(run_id, mode, groups, fallback_share, duration, csv_path, log_path
         "share_note": "Configured scheduler shares are distinct from cgroup cpu.weight and cpu.max.",
         "expected_result_csv": str(csv_path), "expected_scheduler_log": str(log_path),
         "runtime_limitations": "Checks are non-privileged and cannot prove that BPF attach will succeed on this kernel.",
+        "environment": {"kernel_version": platform.release(),
+                        "logical_cpu_count": os.cpu_count() or "NA",
+                        "architecture": platform.machine()},
     }
 
 
 def _write_csv(path, run_id, groups, fallback_share, duration, status, error="",
-               attached=False, shutdown="not_started", rows=None):
+               attached=False, shutdown="not_started", rows=None, worker_path=None):
     rows = rows or {}
     with path.open("w", newline="", encoding="utf-8") as stream:
         writer = csv.DictWriter(stream, fieldnames=RESULT_FIELDS)
@@ -215,6 +226,10 @@ def _write_csv(path, run_id, groups, fallback_share, duration, status, error="",
             measured = rows.get(group["name"], {})
             writer.writerow({
                 "run_id": run_id, "timestamp_utc": timestamp, "group": group["name"],
+                "kernel_version": platform.release(),
+                "logical_cpu_count": os.cpu_count() or "NA",
+                "architecture": platform.machine(),
+                "worker_executable": str(Path(worker_path).resolve()) if worker_path else "NA",
                 "cgroup_id": group["cgroup_id"], "cgroup_path": group["path"],
                 "verified_cgroup_id": group.get("verified_cgroup_id", "NA"),
                 "identity_verification_status": group.get("identity_verification_status", "unverified"),
@@ -249,6 +264,7 @@ def _wait_for_ready(process, timeout, log_stream):
     selector = selectors.DefaultSelector()
     selector.register(process.stdout, selectors.EVENT_READ)
     deadline = time.monotonic() + timeout
+    pending = bytearray()
     try:
         while time.monotonic() < deadline:
             if run_experiment.interrupted:
@@ -257,15 +273,27 @@ def _wait_for_ready(process, timeout, log_stream):
                 raise ExperimentError(f"scheduler loader exited before attachment readiness (status {process.returncode})")
             events = selector.select(min(0.2, max(0, deadline - time.monotonic())))
             for key, _ in events:
-                line = key.fileobj.readline()
-                if not line:
-                    continue
-                log_stream.write(line)
-                log_stream.flush()
-                if line.strip() == READY_LINE:
-                    return
+                chunk = os.read(key.fileobj.fileno(), 4096)
+                if not chunk:
+                    if process.poll() is not None:
+                        raise ExperimentError(
+                            "scheduler loader exited before attachment readiness "
+                            f"(status {process.returncode})")
+                    raise ExperimentError("scheduler loader closed its output before attachment readiness")
+                pending.extend(chunk)
+                while b"\n" in pending:
+                    raw_line, _, remainder = pending.partition(b"\n")
+                    pending = bytearray(remainder)
+                    line = (raw_line + b"\n").decode("utf-8", errors="replace")
+                    log_stream.write(line)
+                    log_stream.flush()
+                    if raw_line.rstrip(b"\r") == READY_LINE.encode("ascii"):
+                        return
         raise ExperimentError("timed out waiting for scheduler attachment readiness")
     finally:
+        if pending:
+            log_stream.write(pending.decode("utf-8", errors="replace"))
+            log_stream.flush()
         selector.close()
 
 
@@ -298,12 +326,12 @@ def _supervisor_metadata(path):
 
 def _stop_loader(process, timeout=10):
     if process.poll() is not None:
-        return "exited"
+        return "exited" if process.returncode == 0 else f"exit_{process.returncode}"
     try:
         process.send_signal(signal.SIGTERM)
     except ProcessLookupError:
         process.wait()
-        return "exited"
+        return "exited" if process.returncode == 0 else f"exit_{process.returncode}"
     try:
         process.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -439,7 +467,7 @@ def run_experiment(args, groups, *, popen=subprocess.Popen):
     manifest["scheduler_log"] = str(log_path)
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     _write_csv(csv_path, run_id, groups, args.fallback_share, args.duration,
-               overall, error, attached, shutdown, rows)
+               overall, error, attached, shutdown, rows, worker_path=args.worker)
     print(f"Result CSV: {csv_path}")
     print(f"Manifest: {manifest_path}")
     if error or overall != "complete":
@@ -455,7 +483,7 @@ def prepare_experiment(args, groups):
     metadata["scheduler_attached"] = False
     manifest_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
     _write_csv(csv_path, run_id, groups, args.fallback_share, args.duration,
-               "not_run_prepared")
+               "not_run_prepared", worker_path=args.worker)
     print(f"Manifest: {manifest_path}")
     print(f"Expected result CSV: {csv_path}")
     return 0

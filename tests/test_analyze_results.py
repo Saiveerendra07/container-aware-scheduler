@@ -142,7 +142,7 @@ class AnalyzeResultsTests(unittest.TestCase):
                                                "nr_periods", "nr_throttled", "throttled_usec"), values):
                         stream.write(f"{counter} {value}\n")
             with open(metadata, "w", encoding="utf-8") as stream:
-                stream.write(f"cg-run\t2026-10-23T00:00:00Z\tkernel\t2\t1.00\tcpu.weight A=100 B=200\tA\t/tmp/A\t1.00\t0\tcomplete\t{before}\t{after}\n")
+                stream.write(f"cg-run\t2026-10-23T00:00:00Z\tkernel\t2\tx86_64\t1.00\tcpu.weight A=100 B=200\tA\t/tmp/A\t1.00\t0\tcomplete\t{before}\t{after}\n")
             write_cgroup_csv(metadata, raw)
             rows, warnings = analyzer.analyze([raw])
             self.assertEqual(warnings, [])

@@ -12,6 +12,7 @@ results/processed/, and plot that exact summary. No workloads are run.
 Options:
   --processed-dir DIR  Summary parent directory (default: results/processed/)
   --graphs-dir DIR     Figure directory (default: graphs/)
+  --repeated-summary   Also write repeated-run statistics and Markdown report
   -h, --help           Show this help
 
 With no CSV paths, the analyzer reads both supported result formats from results/raw/.
@@ -24,6 +25,7 @@ analyzer="$script_dir/analyze_results.py"
 plotter="$script_dir/plot_results.py"
 processed_dir="$repo_root/results/processed"
 graphs_dir=
+repeated_summary=0
 inputs=()
 
 while (( $# )); do
@@ -41,6 +43,10 @@ while (( $# )); do
                 graphs_dir=$2
             fi
             shift 2
+            ;;
+        --repeated-summary)
+            repeated_summary=1
+            shift
             ;;
         -h|--help)
             usage
@@ -88,6 +94,17 @@ else
 fi
 
 printf 'Summary CSV: %s\n' "$summary"
+if (( repeated_summary )); then
+    repeated_script="$script_dir/summarize_repeated_runs.py"
+    if "$python_cmd" "$repeated_script" "${inputs[@]}" --output-dir "$report_dir"; then
+        :
+    else
+        status=$?
+        printf 'Repeated-run analysis failed (exit %s); report directory: %s\n' \
+            "$status" "$report_dir" >&2
+        exit "$status"
+    fi
+fi
 if [[ -n $graphs_dir ]]; then
     if "$python_cmd" "$plotter" "$summary" --graphs-dir "$graphs_dir"; then
         :
