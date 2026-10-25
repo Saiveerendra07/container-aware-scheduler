@@ -42,6 +42,18 @@ and elapsed time, CPU time, and exit status `NA`.
 
 ## Check mode
 
+Before arranging the build, run the read-only prerequisite diagnostic:
+
+```sh
+python3 scripts/check_scheduler_readiness.py
+```
+
+Pass `--scx-root PATH` when the Makefile's reference sched_ext checkout is not
+at `~/scx-c-examples`. The diagnostic does not build, install, alter kernel
+state, create cgroups, attach the scheduler, or run workloads. A passing result
+only confirms that listed prerequisites were detected; it does not prove
+kernel or scheduler compatibility.
+
 Build the loader/BPF object and workload binaries, then run non-attaching checks:
 
 ```sh

@@ -47,6 +47,21 @@ Stop if any check fails; do not treat test success as runtime evidence.
 These are read-only diagnostics. Do not load modules or change kernel, sysctl,
 cgroup, or security settings to make a check pass.
 
+Start with the consolidated project diagnostic:
+
+```sh
+python3 scripts/check_scheduler_readiness.py
+```
+
+Use `--scx-root /absolute/path/to/scx-c-examples` if the reference checkout is
+not at the Makefile default (`~/scx-c-examples`). This command reports every
+missing prerequisite and a suggested next action, and exits nonzero if a
+required prerequisite is missing, the sched_ext state interface is unreadable,
+or its state is not `disabled`. It does not install or change anything. Its
+WSL2 detection is heuristic only. Passing this check is not proof that the
+kernel, verifier, or scheduler attachment is compatible; continue with the
+individual checks below and stop at any failed gate.
+
 ```sh
 uname -a
 uname -r

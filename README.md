@@ -175,6 +175,21 @@ requires Clang with BPF support, `bpftool`, libbpf development files (version
 1.5 or newer), readable kernel BTF, and sched_ext compatibility headers. See
 `docs/scheduler-design.md` before attempting that build.
 
+Run the read-only custom-scheduler readiness diagnostic before arranging a
+build or runtime validation:
+
+```sh
+python3 scripts/check_scheduler_readiness.py
+```
+
+It reports kernel/architecture, BTF, sched_ext state, compiler/tool and libbpf
+prerequisites, and the Makefile's reference sched_ext header paths. Use
+`--scx-root PATH` (or `SCX_ROOT`) when the reference checkout is not at
+`~/scx-c-examples`. A nonzero status means a required prerequisite is missing
+or sched_ext is not currently disabled. The diagnostic is read-only, its WSL
+classification is only a heuristic, and a clean report does not establish
+that the kernel supports or will accept this scheduler.
+
 ## Examples
 
 ### Default-scheduler workloads
