@@ -138,9 +138,39 @@ git -C "$SCX_ROOT" rev-parse HEAD
 
 ## 3. Build from the inspected Makefile
 
-After the read-only checks pass, build the scheduler and workload executables.
-These commands write generated files only under `build/`; they do not attach
-the scheduler or start the worker:
+The institute Linux host should use its known sched_ext reference checkout;
+do not substitute an arbitrary or updated checkout without recording and
+reviewing its revision. The Makefile expects these exact paths under
+`$SCX_ROOT/scheds/include`:
+
+```text
+scx/common.bpf.h
+scx/common.h
+bpf-compat/                 (include directory)
+lib/                        (include directory)
+```
+
+The default `SCX_ROOT` is `~/scx-c-examples`. The Makefile also requires
+`pkg-config` metadata for libbpf **1.5 or newer**. `pkg-config --cflags
+libbpf` supplies compile flags; `pkg-config --libs libbpf` supplies the libbpf
+link flag. The userspace loader additionally links `-lelf -lz -lzstd -lpthread`.
+Clang must expose its BPF target, bpftool must support BTF dumping and skeleton
+generation, and `/sys/kernel/btf/vmlinux` must be readable. The preflight
+prints the resolved commands, include paths, metadata, and outputs for both
+the BPF object and userspace loader:
+
+```sh
+python3 scripts/check_scheduler_readiness.py --build-only --scx-root "$SCX_ROOT"
+```
+
+For build prerequisites alone, use `--build-only`; this still reports
+`/sys/kernel/sched_ext/state` but does not treat `enabled` as a compile blocker.
+The regular diagnostic gates runtime readiness on that state being readable
+and `disabled`.
+
+After the read-only checks pass, build the BPF scheduler and workload
+executables. These commands write generated files only under `build/`; they do
+not attach the scheduler or start the worker:
 
 ```sh
 make SCX_ROOT="$SCX_ROOT" VMLINUX_BTF=/sys/kernel/btf/vmlinux

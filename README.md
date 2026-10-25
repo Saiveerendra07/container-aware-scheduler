@@ -190,6 +190,28 @@ or sched_ext is not currently disabled. The diagnostic is read-only, its WSL
 classification is only a heuristic, and a clean report does not establish
 that the kernel supports or will accept this scheduler.
 
+For build-only status, independent of whether sched_ext is currently enabled,
+use `python3 scripts/check_scheduler_readiness.py --build-only`. It still
+reports the state interface, but gates its exit status on the BPF and
+userspace build prerequisites.
+
+On the institute Linux host, point `SCX_ROOT` at the already-approved
+reference checkout, record its revision, run build preflight, then build both
+the BPF object and loader:
+
+```sh
+SCX_ROOT="$HOME/scx-c-examples"
+git -C "$SCX_ROOT" rev-parse HEAD
+python3 scripts/check_scheduler_readiness.py --build-only --scx-root "$SCX_ROOT"
+make SCX_ROOT="$SCX_ROOT" VMLINUX_BTF=/sys/kernel/btf/vmlinux
+test -s build/group_scheduler.bpf.o
+test -x build/group_scheduler
+```
+
+This procedure does not install or update dependencies. A completed scheduler
+build requires both the BPF object and userspace loader checks to pass; a C
+workload build alone is not a scheduler build.
+
 ## Examples
 
 ### Default-scheduler workloads
