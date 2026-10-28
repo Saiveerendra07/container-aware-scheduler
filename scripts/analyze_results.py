@@ -64,6 +64,36 @@ def jain_index(values):
     return total * total / (len(values) * squares)
 
 
+def _successful_run_row(row):
+    if str(row.get("measurement_status", "")).strip().lower() != "complete":
+        return False
+    exit_status = str(row.get("exit_status", "")).strip()
+    if row.get("result_type") == "cgroup_competition":
+        return exit_status == "0"
+    if exit_status not in ("", "NA", "0"):
+        return False
+    signal_status = str(row.get("termination_signal", "")).strip()
+    return signal_status in ("", "NA", "0")
+
+
+def _group_rows_complete(run_rows):
+    raw_counts = str(run_rows[0].get("group_counts", "")).strip()
+    if not raw_counts:
+        return True
+    expected = {}
+    for item in raw_counts.split(";"):
+        if item.count("=") != 1:
+            return False
+        group, raw_count = item.split("=", 1)
+        if not group or not raw_count.isascii() or not raw_count.isdecimal() or group in expected:
+            return False
+        expected[group] = int(raw_count)
+    actual = defaultdict(int)
+    for row in run_rows:
+        actual[row.get("group", "")] += 1
+    return bool(expected) and dict(actual) == expected
+
+
 def read_file(path):
     rows = []
     warnings = []
@@ -114,12 +144,21 @@ def analyze(paths):
         by_run[row.get("run_id", "")].append(row)
 
     for run_id, run_rows in by_run.items():
+        run_complete = all(_successful_run_row(row) for row in run_rows)
         group_rows = [row for row in run_rows if row.get("result_type") != "cgroup_competition"]
+        if group_rows and not _group_rows_complete(group_rows):
+            run_complete = False
         valid_cpu = []
-        for row in group_rows:
-            cpu = number(row.get("cpu_time_s"))
-            if cpu is not None:
-                valid_cpu.append(cpu)
+        if run_complete:
+            for row in group_rows:
+                cpu = number(row.get("cpu_time_s"))
+                elapsed = number(row.get("elapsed_s"))
+                if cpu is not None and elapsed is not None and elapsed > 0:
+                    valid_cpu.append(cpu)
+                else:
+                    run_complete = False
+                    valid_cpu = []
+                    break
         fairness = jain_index(valid_cpu)
         for row in run_rows:
             if row.get("result_type") == "cgroup_competition":
@@ -137,25 +176,29 @@ def analyze(paths):
                 cpu_usec = counter_number(row["usage_usec_delta"])
                 elapsed = number(row.get("workload_elapsed_s"))
                 # cpu.stat is in microseconds. Invalid or missing deltas stay unavailable.
-                row["cpu_time_s"] = cpu_usec / 1_000_000 if cpu_usec is not None else None
-                row["elapsed_s"] = elapsed
+                row["cpu_time_s"] = cpu_usec / 1_000_000 if run_complete and cpu_usec is not None else None
+                row["elapsed_s"] = elapsed if run_complete else None
                 row["cpu_usage_pct"] = (100.0 * cpu_usec / 1_000_000 / elapsed
-                                        if cpu_usec is not None and elapsed is not None and elapsed > 0
+                                        if run_complete and cpu_usec is not None and elapsed is not None and elapsed > 0
                                         else None)
                 periods = counter_number(row["nr_periods_delta"])
                 throttled = counter_number(row["nr_throttled_delta"])
                 throttled_usec = counter_number(row["throttled_usec_delta"])
                 row["nr_periods_delta"] = periods
                 row["nr_throttled_delta"] = throttled
-                row["throttled_time_s"] = throttled_usec / 1_000_000 if throttled_usec is not None else None
+                row["throttled_time_s"] = (throttled_usec / 1_000_000
+                                            if run_complete and throttled_usec is not None else None)
                 row["throttled_period_pct"] = (100.0 * throttled / periods
-                                               if throttled is not None and periods is not None and periods > 0
+                                               if run_complete and throttled is not None
+                                               and periods is not None and periods > 0
                                                else None)
                 row["jain_fairness_index"] = None
                 row["fairness_workers"] = 0
                 continue
-            cpu = number(row.get("cpu_time_s"))
-            elapsed = number(row.get("elapsed_s"))
+            cpu = number(row.get("cpu_time_s")) if run_complete else None
+            elapsed = number(row.get("elapsed_s")) if run_complete else None
+            row["cpu_time_s"] = cpu
+            row["elapsed_s"] = elapsed
             usage = 100.0 * cpu / elapsed if cpu is not None and elapsed and elapsed > 0 else None
             row["cpu_usage_pct"] = usage
             row["jain_fairness_index"] = fairness

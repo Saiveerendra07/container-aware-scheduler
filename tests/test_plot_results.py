@@ -62,7 +62,8 @@ class PlotResultsTests(unittest.TestCase):
              "measurement_status": "incomplete", "exit_status": "143",
              "_summary_file": "summary.csv", "_line": 2},
             {"result_type": "cgroup_competition", "run_id": "cg2", "group": "B",
-             "cpu_usage_pct": "NA", "nr_throttled_delta": "bad", "throttled_time_s": "NA",
+             "cpu_usage_pct": "55", "nr_throttled_delta": "5", "throttled_time_s": "0.3",
+             "measurement_status": "complete", "exit_status": "0",
              "_summary_file": "summary.csv", "_line": 3},
         ]
         cpu, fairness, cgroup, warnings = plotter.plot_data(records)
@@ -70,11 +71,24 @@ class PlotResultsTests(unittest.TestCase):
         self.assertEqual(fairness, {})
         self.assertEqual(warnings, [])
         self.assertEqual(len(cgroup), 1)
-        self.assertEqual(cgroup[0]["usage"], 40)
-        self.assertEqual(cgroup[0]["throttled_periods"], 3)
-        self.assertEqual(cgroup[0]["throttled_time_s"], .2)
-        self.assertIn("incomplete", plotter._cgroup_label(cgroup[0]))
-        self.assertIn("143", plotter._cgroup_label(cgroup[0]))
+        self.assertEqual(cgroup[0]["usage"], 55)
+        self.assertEqual(cgroup[0]["throttled_periods"], 5)
+        self.assertEqual(cgroup[0]["throttled_time_s"], .3)
+
+    def test_one_failed_group_row_excludes_all_run_rows_from_plots(self):
+        records = [
+            {"run_id": "mixed", "worker_id": "w1", "group": "A",
+             "cpu_usage_pct": "50", "jain_fairness_index": "1", "fairness_workers": "2",
+             "measurement_status": "complete", "exit_status": "0"},
+            {"run_id": "mixed", "worker_id": "w2", "group": "B",
+             "cpu_usage_pct": "NA", "jain_fairness_index": "1", "fairness_workers": "2",
+             "measurement_status": "incomplete", "exit_status": "1"},
+        ]
+        cpu, fairness, cgroup, warnings = plotter.plot_data(records)
+        self.assertEqual(cpu, [])
+        self.assertEqual(fairness, {})
+        self.assertEqual(cgroup, [])
+        self.assertEqual(warnings, [])
 
 
 if __name__ == "__main__":

@@ -27,14 +27,14 @@ CPU use over its measured elapsed interval, not total machine utilization.
 Values slightly over 100% can occur due to differences in CPU accounting and
 elapsed-time measurements.
 
-Jain's fairness index is calculated from available per-worker CPU-time values
-within a run: `(sum(cpu_time)^2) / (worker_count * sum(cpu_time^2))`. A value
-of 1 means workers received equal CPU time; values approach 0 as allocation
-becomes more unequal. It measures equality among workers, not weighted/share
-fairness between groups, latency, or scheduler quality. Incomplete rows with
-usable CPU time can contribute; the summary reports how many measurements
-were included. If there are no valid CPU-time values or all are zero, the
-index is unavailable.
+Jain's fairness index is calculated from per-worker CPU-time values within a
+run: `(sum(cpu_time)^2) / (worker_count * sum(cpu_time^2))`. A value of 1
+means workers received equal CPU time; values approach 0 as allocation becomes
+more unequal. It measures equality among workers, not weighted/share fairness
+between groups, latency, or scheduler quality. Derived group-run metrics
+require every represented worker row to be complete and successful; when any
+row is incomplete, failed, or missing relative to recorded `group_counts`,
+CPU usage and Jain fairness for the entire run are unavailable.
 
 This per-worker Jain index measures equality and is not a comparison against
 configured group weights. Use [`fairness-evaluation.md`](fairness-evaluation.md)
@@ -59,11 +59,13 @@ periods and `throttled_usec_delta` is converted to `throttled_time_s`.
 `throttled_period_pct` is `100 * nr_throttled_delta / nr_periods_delta`, only
 when `nr_periods_delta` is positive. Throttling counters are kernel accounting,
 not latency measurements. A nonzero `exit_status` or
-`measurement_status=incomplete` is retained even when some counters are valid;
-only the individual unavailable metrics are omitted. Missing/`NA`, malformed,
-negative, or reset-counter snapshots produce `NA` deltas in the summary. The
-original `measurement_status` and `exit_status` are retained; incomplete runs
-can still have valid individual counter deltas.
+`measurement_status=incomplete` is retained even when counter snapshots are
+valid. Raw snapshots and their valid deltas remain visible for diagnosis, but
+derived CPU usage and throttling metrics are unavailable for the failed run.
+For successful runs with partial counter availability, each metric remains
+individually available only when its required counters are valid.
+Missing/`NA`, malformed, negative, or reset-counter snapshots produce `NA`
+deltas in the summary.
 
 The derived cgroup columns are `cpu_time_s`, `elapsed_s`, `cpu_usage_pct`,
 `nr_periods_delta`, `nr_throttled_delta`, `throttled_time_s`,

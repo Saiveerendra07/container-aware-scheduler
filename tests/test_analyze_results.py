@@ -56,8 +56,45 @@ class AnalyzeResultsTests(unittest.TestCase):
             result, _ = analyzer.analyze([path])
         self.assertIsNone(result[0]["cpu_usage_pct"])
         self.assertIsNone(result[1]["cpu_usage_pct"])
-        self.assertEqual(result[0]["fairness_workers"], 1)
-        self.assertEqual(result[0]["jain_fairness_index"], 1)
+        self.assertEqual(result[0]["fairness_workers"], 0)
+        self.assertIsNone(result[0]["jain_fairness_index"])
+
+    def test_one_failed_worker_excludes_all_run_metrics(self):
+        rows = [
+            {"run_id": "r", "worker_id": "w1", "group": "latency",
+             "cpu_time_s": "1", "elapsed_s": "2", "exit_status": "0",
+             "measurement_status": "complete"},
+            {"run_id": "r", "worker_id": "w2", "group": "batch",
+             "cpu_time_s": "3", "elapsed_s": "3", "exit_status": "1",
+             "measurement_status": "complete"},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "input.csv")
+            with open(path, "w", newline="") as stream:
+                writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+                writer.writeheader()
+                writer.writerows(rows)
+            result, _ = analyzer.analyze([path])
+        self.assertTrue(all(row["cpu_time_s"] is None for row in result))
+        self.assertTrue(all(row["cpu_usage_pct"] is None for row in result))
+        self.assertTrue(all(row["jain_fairness_index"] is None for row in result))
+
+    def test_missing_group_worker_excludes_run_using_recorded_group_counts(self):
+        rows = [
+            {"run_id": "r", "worker_id": "w1", "group": "alpha",
+             "group_counts": "alpha=1;beta=1", "cpu_time_s": "1", "elapsed_s": "2",
+             "measurement_status": "complete"},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "input.csv")
+            with open(path, "w", newline="") as stream:
+                writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+                writer.writeheader()
+                writer.writerows(rows)
+            result, _ = analyzer.analyze([path])
+        self.assertIsNone(result[0]["cpu_time_s"])
+        self.assertIsNone(result[0]["cpu_usage_pct"])
+        self.assertIsNone(result[0]["jain_fairness_index"])
 
     def test_real_cgroup_schema_derives_group_cpu_and_throttling_metrics(self):
         row = {column: "NA" for column in CGROUP_COLUMNS}
@@ -129,6 +166,30 @@ class AnalyzeResultsTests(unittest.TestCase):
         self.assertEqual(summary["usage_usec_delta"], "NA")
         self.assertEqual(summary["cpu_usage_pct"], "NA")
 
+    def test_failed_cgroup_run_hides_derived_metrics_but_keeps_counter_deltas(self):
+        row = {column: "NA" for column in CGROUP_COLUMNS}
+        row.update({"run_id": "cg-failed", "group": "A", "workload_elapsed_s": "2",
+                    "exit_status": "143", "measurement_status": "incomplete",
+                    "control_setting": "cpu.weight A=100 B=100"})
+        for counter, after in (("usage_usec", 1000000), ("user_usec", 900000),
+                               ("system_usec", 100000), ("nr_periods", 10),
+                               ("nr_throttled", 2), ("throttled_usec", 1000)):
+            row[f"{counter}_before"] = "0"
+            row[f"{counter}_after"] = str(after)
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "cgroup_competition_test.csv")
+            with open(path, "w", newline="") as stream:
+                writer = csv.DictWriter(stream, fieldnames=CGROUP_COLUMNS)
+                writer.writeheader()
+                writer.writerow(row)
+            result, _ = analyzer.analyze([path])
+        measured = result[0]
+        self.assertEqual(measured["measurement_status"], "incomplete")
+        self.assertEqual(measured["usage_usec_delta"], 1000000)
+        self.assertIsNone(measured["cpu_time_s"])
+        self.assertIsNone(measured["cpu_usage_pct"])
+        self.assertIsNone(measured["throttled_time_s"])
+
     def test_actual_writer_csv_flows_through_analyzer_summary_columns(self):
         with tempfile.TemporaryDirectory() as directory:
             before = os.path.join(directory, "before.stat")
@@ -172,7 +233,7 @@ class AnalyzeResultsTests(unittest.TestCase):
                "cpu_time_s": "1", "elapsed_s": "2", "measurement_status": "complete"}
         cg = {column: "NA" for column in CGROUP_COLUMNS}
         cg.update({"run_id": "new", "group": "A", "workload_elapsed_s": "1",
-                   "measurement_status": "complete", "usage_usec_delta": "500000",
+                   "exit_status": "0", "measurement_status": "complete", "usage_usec_delta": "500000",
                    "nr_periods_delta": "1", "nr_throttled_delta": "0",
                    "throttled_usec_delta": "0"})
         for counter, delta in (("usage_usec", 500000), ("user_usec", 500000),

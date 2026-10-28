@@ -1,4 +1,5 @@
 import csv
+import json
 import importlib.util
 import os
 import subprocess
@@ -17,6 +18,29 @@ SPEC.loader.exec_module(evaluator)
 
 
 class FairnessEvaluationTests(unittest.TestCase):
+    def custom_rows(self):
+        groups = [
+            {"name": "alpha", "cgroup_id": 101, "cgroup_path": "/synthetic/alpha", "share": 100},
+            {"name": "beta", "cgroup_id": 202, "cgroup_path": "/synthetic/beta", "share": 300},
+        ]
+        config = json.dumps({"expected_group_count": 2, "fallback_share": 50,
+                             "groups": groups}, sort_keys=True, separators=(",", ":"))
+        rows = []
+        for group in groups:
+            rows.append({
+                "run_id": "synthetic_test_only_custom", "group": group["name"],
+                "cgroup_id": str(group["cgroup_id"]), "cgroup_path": group["cgroup_path"],
+                "verified_cgroup_id": str(group["cgroup_id"]),
+                "identity_verification_status": "verified",
+                "group_share": str(group["share"]), "fallback_share": "50",
+                "cpu_time_s": str(group["share"]), "measurement_status": "complete",
+                "workload_elapsed_s": "2", "completion_status": "complete",
+                "exit_status": "0", "termination_signal": "0", "scheduler_attached": "true",
+                "scheduler_shutdown_status": "stopped", "custom_scheduler_schema_version": "2",
+                "expected_group_count": "2", "expected_group_config_json": config,
+            })
+        return rows
+
     def group_csv(self, directory, name, rows, fields=None):
         path = os.path.join(directory, name)
         fields = fields or list(rows[0])
@@ -91,9 +115,102 @@ class FairnessEvaluationTests(unittest.TestCase):
         self.assertEqual(result["alpha"]["cpu_time_s"], "NA")
         self.assertIn("measurement_status is not complete",
                       result["alpha"]["measurement_exclusion_reason"])
-        self.assertEqual(result["alpha"]["jain_group_count"], 1)
+        self.assertEqual(result["alpha"]["jain_group_count"], 0)
         self.assertEqual(result["alpha"]["jain_fairness_index"], "NA")
         self.assertEqual(result["beta"]["allocation_error_pct_points"], "NA")
+        self.assertEqual(result["beta"]["cpu_time_s"], "NA")
+        self.assertEqual(result["beta"]["observed_cpu_pct"], "NA")
+
+    def test_incomplete_group_excludes_surviving_groups_from_run_metrics(self):
+        rows = [
+            {"run_id": "synthetic_test_only_partial", "group": "alpha", "cpu_time_s": "5",
+             "measurement_status": "complete", "group_share": "1"},
+            {"run_id": "synthetic_test_only_partial", "group": "beta", "cpu_time_s": "5",
+             "measurement_status": "complete", "group_share": "1"},
+            {"run_id": "synthetic_test_only_partial", "group": "gamma", "cpu_time_s": "NA",
+             "measurement_status": "interrupted", "group_share": "1"},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.evaluate(self.group_csv(
+                directory, "synthetic_test_only_partial.csv", rows))
+        for group in ("alpha", "beta", "gamma"):
+            self.assertEqual(result[group]["cpu_time_s"], "NA")
+            self.assertEqual(result[group]["observed_cpu_pct"], "NA")
+            self.assertEqual(result[group]["jain_fairness_index"], "NA")
+            self.assertEqual(result[group]["allocation_error_pct_points"], "NA")
+
+    def test_custom_run_rejects_missing_expected_group_row(self):
+        rows = self.custom_rows()[:1]
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.evaluate(self.group_csv(directory, "custom_missing.csv", rows))
+        self.assertIn("beta", result)
+        self.assertEqual(result["alpha"]["observed_cpu_pct"], "NA")
+        self.assertIn("expected group row 'beta' is missing",
+                      result["alpha"]["allocation_unavailable_reason"])
+
+    def test_custom_run_rejects_duplicate_group_row(self):
+        rows = self.custom_rows()
+        rows.append(dict(rows[0]))
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.evaluate(self.group_csv(directory, "custom_duplicate.csv", rows))
+        self.assertEqual(result["alpha"]["observed_cpu_pct"], "NA")
+        self.assertIn("result row count does not match expected group count",
+                      result["alpha"]["allocation_unavailable_reason"])
+        self.assertIn("expected group row 'alpha' is duplicated",
+                      result["alpha"]["allocation_unavailable_reason"])
+
+    def test_custom_run_rejects_mismatched_share_and_group_metadata(self):
+        rows = self.custom_rows()
+        rows[1]["group_share"] = "200"
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.evaluate(self.group_csv(directory, "custom_share_mismatch.csv", rows))
+        self.assertEqual(result["alpha"]["expected_cpu_pct"], "NA")
+        self.assertIn("configured share mismatch for group 'beta'",
+                      result["alpha"]["allocation_unavailable_reason"])
+
+    def test_custom_run_rejects_cgroup_identity_mismatch(self):
+        rows = self.custom_rows()
+        rows[1]["verified_cgroup_id"] = "999"
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.evaluate(self.group_csv(directory, "custom_id_mismatch.csv", rows))
+        self.assertEqual(result["alpha"]["cpu_time_s"], "NA")
+        self.assertIn("cgroup identity mismatch for group 'beta'",
+                      result["alpha"]["allocation_unavailable_reason"])
+
+    def test_custom_run_rejects_unattached_or_unclean_shutdown(self):
+        for field, value, reason in (
+            ("scheduler_attached", "false", "scheduler attachment was not confirmed"),
+            ("scheduler_shutdown_status", "exit_9", "scheduler shutdown was not confirmed clean"),
+        ):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
+                rows = self.custom_rows()
+                rows[0][field] = value
+                result = self.evaluate(self.group_csv(directory, "custom_lifecycle.csv", rows))
+                self.assertEqual(result["alpha"]["observed_cpu_pct"], "NA")
+                self.assertIn(reason, result["alpha"]["allocation_unavailable_reason"])
+
+    def test_legacy_custom_run_without_expected_metadata_is_explicitly_excluded(self):
+        rows = self.custom_rows()
+        for row in rows:
+            for field in ("custom_scheduler_schema_version", "expected_group_count",
+                          "expected_group_config_json"):
+                row.pop(field)
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.evaluate(self.group_csv(directory, "custom_legacy.csv", rows))
+        self.assertEqual(result["alpha"]["cpu_time_s"], "NA")
+        self.assertIn("legacy custom-scheduler result lacks expected-group configuration metadata",
+                      result["alpha"]["allocation_unavailable_reason"])
+
+    def test_custom_incomplete_run_preserves_reason_but_has_no_metrics(self):
+        rows = self.custom_rows()
+        rows[1]["measurement_status"] = "incomplete"
+        rows[1]["cpu_time_s"] = "NA"
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.evaluate(self.group_csv(directory, "custom_incomplete.csv", rows))
+        self.assertEqual(result["alpha"]["observed_cpu_pct"], "NA")
+        self.assertEqual(result["beta"]["cpu_time_s"], "NA")
+        self.assertIn("measurement_status is not complete",
+                      result["beta"]["measurement_exclusion_reason"])
 
     def test_actual_cgroup_cpu_weight_schema_uses_counter_snapshots(self):
         rows = []

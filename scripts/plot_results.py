@@ -59,9 +59,24 @@ def plot_data(records):
     cgroup_rows = []
     fairness_by_run = {}
     warnings = []
+    invalid_runs = set()
+    for row in records:
+        run_id = row.get("run_id", "").strip()
+        result_type = row.get("result_type", "group_competition")
+        status = row.get("measurement_status", "").strip().lower()
+        exit_status = str(row.get("exit_status", "")).strip()
+        termination_signal = str(row.get("termination_signal", "")).strip()
+        if (status not in ("", "na", "complete")
+                or (result_type == "cgroup_competition" and status != "complete")
+                or (exit_status not in ("", "NA", "0"))
+                or (termination_signal not in ("", "NA", "0"))):
+            invalid_runs.add((result_type, run_id))
+
     for row in records:
         run_id = row.get("run_id", "").strip()
         group = row.get("group", "").strip() or "unspecified"
+        if (row.get("result_type", "group_competition"), run_id) in invalid_runs:
+            continue
         if row.get("result_type") == "cgroup_competition":
             usage = parse_number(row.get("cpu_usage_pct"))
             periods = parse_number(row.get("nr_throttled_delta"))

@@ -157,6 +157,8 @@ def _run_exclusion(rows, mode, schema):
         if len(values) > 1:
             reasons.append(f"inconsistent {field} values within run")
     if schema == "custom_scheduler":
+        reasons.extend(f"custom configuration: {reason}"
+                       for reason in fairness.validate_custom_run_rows(rows))
         shares_by_group = defaultdict(set)
         for row in rows:
             shares_by_group[_text(row.get("group"))].add(_text(row.get("group_share")))
@@ -212,18 +214,36 @@ def _run_configuration(rows, mode, schema):
             name: sum(_text(row.get("group")) == name for row in rows) for name in groups
         }
     if schema == "custom_scheduler":
+        expected = fairness.custom_configuration_from_rows(rows)
+        if isinstance(expected, dict) and isinstance(expected.get("groups"), list):
+            config["custom_scheduler_schema_version"] = _text(
+                first.get("custom_scheduler_schema_version"))
+            config["expected_group_count"] = expected.get("expected_group_count")
+            config["expected_group_config"] = expected
+            groups = sorted(group.get("name", "") for group in expected["groups"]
+                            if isinstance(group, dict))
+            config["groups"] = groups
+        else:
+            config["expected_group_config"] = "unavailable_legacy_metadata"
         shares = {}
-        for name in groups:
-            raw_share = _text(next(row.get("group_share", "") for row in rows
-                                   if _text(row.get("group")) == name))
+        configured_names = groups
+        for name in configured_names:
+            group_row = next((row for row in rows if _text(row.get("group")) == name), None)
+            if group_row is None:
+                shares[name] = next((
+                    group.get("share") for group in (expected or {}).get("groups", [])
+                    if isinstance(group, dict) and group.get("name") == name
+                ), "NA")
+                continue
+            raw_share = _text(group_row.get("group_share", ""))
             shares[name] = int(raw_share) if raw_share.isascii() and raw_share.isdecimal() else raw_share
         config["configured_shares"] = shares
         config["cgroup_cpu_controls"] = {
             name: {
-                "cpu_weight": _text(next(row.get("cgroup_cpu_weight", "") for row in rows
-                                          if _text(row.get("group")) == name)),
-                "cpu_max": _text(next(row.get("cgroup_cpu_max", "") for row in rows
-                                      if _text(row.get("group")) == name)),
+                "cpu_weight": _text(next((row.get("cgroup_cpu_weight", "") for row in rows
+                                           if _text(row.get("group")) == name), "NA")),
+                "cpu_max": _text(next((row.get("cgroup_cpu_max", "") for row in rows
+                                       if _text(row.get("group")) == name), "NA")),
             } for name in groups
         }
     if schema == "cgroup_competition":

@@ -106,22 +106,67 @@ the BPF target. A command being present is not enough: stop if the BPF target
 is absent, `bpftool` cannot run, pkg-config cannot find libbpf, or the version
 is below the requirement.
 
-The Makefile default reference-header root is `~/scx-c-examples`. Set
-`SCX_ROOT` to the existing sched_ext examples checkout if it is elsewhere, and
-inspect the exact files consumed by this Makefile:
+### Build libbpf privately when needed
+
+The Makefile requires libbpf **1.5 or newer**, not a particular patch release.
+The following uses the exact upstream `v1.5.0` tag, which satisfies that
+minimum, and stages its headers, library, and pkg-config file under `/tmp`.
+It does not install a package or alter system library paths. The source build
+uses the host's existing `libelf` and `zlib` development metadata; stop if
+those are unavailable rather than changing system packages during validation.
 
 ```sh
-SCX_ROOT=~/scx-c-examples
+DEPS_ROOT=/tmp/container-aware-scheduler-deps
+LIBBPF_SRC="$DEPS_ROOT/libbpf"
+LIBBPF_BUILD="$DEPS_ROOT/libbpf-build"
+LIBBPF_PREFIX="$DEPS_ROOT/prefix"
+LIBBPF_COMMIT=09b9e83102eb8ab9e540d36b4559c55f3bcdb95d
+mkdir -p "$DEPS_ROOT"
+git clone --depth 1 --branch v1.5.0 \
+  https://github.com/libbpf/libbpf.git "$LIBBPF_SRC"
+test "$(git -C "$LIBBPF_SRC" rev-parse HEAD)" = "$LIBBPF_COMMIT"
+make -C "$LIBBPF_SRC/src" OBJDIR="$LIBBPF_BUILD" \
+  PREFIX="$LIBBPF_PREFIX" LIBDIR="$LIBBPF_PREFIX/lib" \
+  INCLUDEDIR="$LIBBPF_PREFIX/include"
+make -C "$LIBBPF_SRC/src" install OBJDIR="$LIBBPF_BUILD" \
+  PREFIX="$LIBBPF_PREFIX" LIBDIR="$LIBBPF_PREFIX/lib" \
+  INCLUDEDIR="$LIBBPF_PREFIX/include"
+export PKG_CONFIG_PATH="$LIBBPF_PREFIX/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+export LD_LIBRARY_PATH="$LIBBPF_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+pkg-config --modversion libbpf
+pkg-config --cflags --libs libbpf
+```
+
+The version query should print `1.5.0`; pkg-config flags should point at the
+private prefix and include `-L.../prefix/lib -lbpf`. `PKG_CONFIG_PATH` selects
+the metadata for Make and the diagnostic, and the resulting `-I`/`-L` flags
+select the private headers and link library. `LD_LIBRARY_PATH` is needed when
+running the resulting dynamically linked loader so it resolves the same local
+`libbpf.so.1`; it does not select headers or affect compilation. Keep these
+exports in the shell used for preflight, build, and any later loader inspection.
+
+The Makefile default reference-header root is `~/scx-c-examples`, from the
+`sched-ext/scx-c-examples` project. The required path layout alone does not
+identify a compatible revision: this scheduler repository has no pinned
+reference commit or version. Do not use an arbitrary checkout or current
+upstream `main` as an assumed match. Use the institute-approved checkout,
+record its commit, and let the actual BPF and loader compilation below verify
+the APIs. Set `SCX_ROOT` to that existing checkout and inspect the exact files
+consumed by this Makefile:
+
+```sh
+SCX_ROOT=/absolute/path/to/institute-approved/scx-c-examples
+git -C "$SCX_ROOT" rev-parse HEAD
 test -f "$SCX_ROOT/scheds/include/scx/common.bpf.h"
 test -f "$SCX_ROOT/scheds/include/scx/common.h"
 test -d "$SCX_ROOT/scheds/include/bpf-compat"
 test -d "$SCX_ROOT/scheds/include/lib"
 ```
 
-If the checkout is elsewhere, replace that assignment with its real absolute
-path. Do not clone, install, or update dependencies during the validation
-window without the system owner's approval. The expected running-kernel BTF
-path is `/sys/kernel/btf/vmlinux`; check it again before build:
+If the checkout is elsewhere, set its real absolute path. Do not clone, install,
+or update the sched_ext reference tree during the validation window without
+the system owner's approval. The expected running-kernel BTF path is
+`/sys/kernel/btf/vmlinux`; check it again before build:
 
 ```sh
 test -r /sys/kernel/btf/vmlinux

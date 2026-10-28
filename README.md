@@ -173,7 +173,9 @@ gcc -O2 -Wall -Wextra -std=c11 workloads/cpu_worker.c -o workloads/cpu_worker
 The `make` target builds the **custom scheduler loader**, not the workload. It
 requires Clang with BPF support, `bpftool`, libbpf development files (version
 1.5 or newer), readable kernel BTF, and sched_ext compatibility headers. See
-`docs/scheduler-design.md` before attempting that build.
+`docs/scheduler-design.md` before attempting that build. On hosts whose system
+libbpf is older, the runtime validation checklist documents how to build
+libbpf 1.5.0 into a private `/tmp` prefix without replacing system libraries.
 
 Run the read-only custom-scheduler readiness diagnostic before arranging a
 build or runtime validation:
@@ -196,7 +198,11 @@ reports the state interface, but gates its exit status on the BPF and
 userspace build prerequisites.
 
 On the institute Linux host, point `SCX_ROOT` at the already-approved
-reference checkout, record its revision, run build preflight, then build both
+`sched-ext/scx-c-examples` reference checkout and record its revision. This
+project does not pin a compatible checkout commit; do not substitute an
+unreviewed upstream revision. If the system libbpf is below 1.5, first follow
+the private `/tmp` build procedure in
+`docs/runtime-validation-checklist.md`. Then run build preflight and build both
 the BPF object and loader:
 
 ```sh
@@ -375,9 +381,11 @@ command; the custom scheduler has not yet been runtime validated. See
   utilization. It can be unavailable or slightly above 100% due to interval
   and accounting differences.
 - **Jain's fairness index:** The analyzer derives
-  `(sum(cpu_time)^2) / (n * sum(cpu_time^2))` from workers with valid CPU-time
-  measurements in a run. It describes equality among workers (1.0 means equal
-  CPU time), not weighted fairness between groups or scheduler quality.
+  `(sum(cpu_time)^2) / (n * sum(cpu_time^2))` from complete, successful worker
+  runs. If a worker fails, is incomplete, or is missing relative to the
+  recorded group counts, all derived CPU and Jain metrics for that run are
+  unavailable. It describes equality among workers (1.0 means equal CPU time),
+  not weighted fairness between groups or scheduler quality.
 - **Throttling and latency:** The group-results analyzer does not collect
   cgroup `cpu.stat` throttling deltas. The cgroup analyzer converts valid
   `usage_usec_delta` into CPU seconds and average CPU usage percentage, and

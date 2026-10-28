@@ -119,7 +119,10 @@ class CustomSchedulerRunnerTests(unittest.TestCase):
             self.assertTrue(all(row["cpu_time_s"] == "NA" for row in rows))
             self.assertTrue(all(row["scheduler_attached"] == "false" for row in rows))
             manifest = json.loads(next((root / "out").glob("*.json")).read_text())
-            self.assertIn("exited before attachment readiness", manifest["error"])
+            self.assertTrue(any(message in manifest["error"] for message in (
+                "exited before attachment readiness",
+                "closed its output before attachment readiness",
+            )))
 
     def test_partial_readiness_output_cannot_bypass_attach_timeout(self):
         runner = load_runner()
@@ -349,6 +352,16 @@ metadata.write_text('123\\t1000000000\\t1000000\\t500000\\t0\\t0\\t0\\t0\\n')
             self.assertTrue(all(row["measurement_status"] == "complete" for row in first_rows))
             self.assertTrue(all(row["measurement_status"] == "incomplete" for row in second_rows))
             self.assertTrue(all(row["cpu_time_s"] == "NA" for row in second_rows))
+            expected_config = json.loads(first_rows[0]["expected_group_config_json"])
+            self.assertEqual(first_rows[0]["custom_scheduler_schema_version"], "2")
+            self.assertEqual(first_rows[0]["expected_group_count"], "2")
+            self.assertEqual(expected_config["expected_group_count"], 2)
+            self.assertEqual(expected_config["fallback_share"], 50)
+            self.assertEqual([group["name"] for group in expected_config["groups"]],
+                             ["alpha", "beta"])
+            self.assertTrue(all(row["expected_group_config_json"]
+                                == first_rows[0]["expected_group_config_json"]
+                                for row in first_rows))
 
 
 if __name__ == "__main__":

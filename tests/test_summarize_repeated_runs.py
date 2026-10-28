@@ -2,6 +2,7 @@
 
 import csv
 import importlib.util
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -68,6 +69,41 @@ def write_run(path, run_id, cpu_times, *, duration="1", kernel="test-kernel",
 
 
 class RepeatedRunSummaryTests(unittest.TestCase):
+    def custom_rows(self, run_id="custom"):
+        expected = [
+            {"name": "a", "cgroup_id": 11, "cgroup_path": "/synthetic/a", "share": 100},
+            {"name": "b", "cgroup_id": 22, "cgroup_path": "/synthetic/b", "share": 300},
+        ]
+        config = json.dumps({"expected_group_count": 2, "fallback_share": 50,
+                             "groups": expected}, sort_keys=True, separators=(",", ":"))
+        rows = []
+        for group in expected:
+            rows.append({
+                "run_id": run_id, "group": group["name"],
+                "group_share": group["share"], "fallback_share": 50,
+                "kernel_version": "test-kernel", "logical_cpu_count": 4,
+                "architecture": "x86_64", "worker_executable": "/worker/cpu",
+                "cgroup_id": group["cgroup_id"], "cgroup_path": group["cgroup_path"],
+                "verified_cgroup_id": group["cgroup_id"],
+                "identity_verification_status": "verified",
+                "cgroup_cpu_weight": 100, "cgroup_cpu_max": "max 100000",
+                "requested_duration_s": 1, "cpu_time_s": 1 if group["name"] == "a" else 3,
+                "workload_elapsed_s": 2, "completion_status": "complete",
+                "exit_status": 0, "termination_signal": 0,
+                "measurement_status": "complete", "scheduler_attached": "true",
+                "scheduler_shutdown_status": "stopped",
+                "custom_scheduler_schema_version": "2", "expected_group_count": 2,
+                "expected_group_config_json": config,
+            })
+        return rows
+
+    def write_custom_csv(self, path, rows):
+        fields = list(rows[0])
+        with path.open("w", newline="", encoding="utf-8") as stream:
+            writer = csv.DictWriter(stream, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(rows)
+
     def test_repeated_runs_calculate_statistics_and_fairness_metrics(self):
         summary = load_module()
         with tempfile.TemporaryDirectory(prefix="synthetic_test_only_") as temp:
@@ -171,22 +207,40 @@ class RepeatedRunSummaryTests(unittest.TestCase):
             source = Path(temp) / "custom.csv"
             fields = ["run_id", "group", "group_share", "fallback_share",
                       "kernel_version", "logical_cpu_count", "architecture", "worker_executable",
+                      "cgroup_id", "cgroup_path", "verified_cgroup_id",
+                      "identity_verification_status", "custom_scheduler_schema_version",
+                      "expected_group_count", "expected_group_config_json",
                       "cgroup_cpu_weight", "cgroup_cpu_max",
-                      "requested_duration_s", "cpu_time_s", "workload_elapsed_s",
+                      "requested_duration_s", "cpu_time_s", "workload_elapsed_s", "completion_status",
                       "exit_status", "termination_signal", "measurement_status",
                       "scheduler_attached", "scheduler_shutdown_status"]
             with source.open("w", newline="", encoding="utf-8") as stream:
                 writer = csv.DictWriter(stream, fieldnames=fields)
                 writer.writeheader()
+                expected_config = json.dumps({
+                    "expected_group_count": 2, "fallback_share": 50,
+                    "groups": [
+                        {"name": "a", "cgroup_id": 11, "cgroup_path": "/synthetic/a", "share": 100},
+                        {"name": "b", "cgroup_id": 22, "cgroup_path": "/synthetic/b", "share": 300},
+                    ],
+                }, sort_keys=True, separators=(",", ":"))
                 for run_id, values in (("one", (1, 3)), ("two", (2, 6))):
                     for group, share, cpu in (("a", 100, values[0]), ("b", 300, values[1])):
                         writer.writerow({"run_id": run_id, "group": group,
                                          "group_share": share, "fallback_share": 50,
                                          "kernel_version": "test-kernel", "logical_cpu_count": 4,
                                          "architecture": "x86_64", "worker_executable": "/worker/cpu",
+                                         "cgroup_id": 11 if group == "a" else 22,
+                                         "cgroup_path": f"/synthetic/{group}",
+                                         "verified_cgroup_id": 11 if group == "a" else 22,
+                                         "identity_verification_status": "verified",
+                                         "custom_scheduler_schema_version": "2",
+                                         "expected_group_count": 2,
+                                         "expected_group_config_json": expected_config,
                                          "cgroup_cpu_weight": 100, "cgroup_cpu_max": "max 100000",
                                          "requested_duration_s": 1, "cpu_time_s": cpu,
-                                         "workload_elapsed_s": 2, "exit_status": 0,
+                                         "workload_elapsed_s": 2, "completion_status": "complete",
+                                         "exit_status": 0,
                                          "termination_signal": 0,
                                          "measurement_status": "complete",
                                          "scheduler_attached": "true",
@@ -210,9 +264,17 @@ class RepeatedRunSummaryTests(unittest.TestCase):
                                          "group_share": share, "fallback_share": 50,
                                          "kernel_version": "test-kernel", "logical_cpu_count": 4,
                                          "architecture": "x86_64", "worker_executable": worker,
+                                         "cgroup_id": 11 if group == "a" else 22,
+                                         "cgroup_path": f"/synthetic/{group}",
+                                         "verified_cgroup_id": 11 if group == "a" else 22,
+                                         "identity_verification_status": "verified",
+                                         "custom_scheduler_schema_version": "2",
+                                         "expected_group_count": 2,
+                                         "expected_group_config_json": expected_config,
                                          "cgroup_cpu_weight": weight, "cgroup_cpu_max": "max 100000",
                                          "requested_duration_s": 1, "cpu_time_s": cpu,
-                                         "workload_elapsed_s": 2, "exit_status": 0,
+                                         "workload_elapsed_s": 2, "completion_status": "complete",
+                                         "exit_status": 0,
                                          "termination_signal": 0, "measurement_status": "complete",
                                          "scheduler_attached": "true", "scheduler_shutdown_status": "stopped"})
             rows, exclusions, _warnings = summary.summarize([str(source)])
@@ -229,9 +291,17 @@ class RepeatedRunSummaryTests(unittest.TestCase):
                                      "group_share": share, "fallback_share": 50,
                                      "kernel_version": "test-kernel", "logical_cpu_count": 4,
                                      "architecture": "x86_64", "worker_executable": "/worker/cpu",
+                                     "cgroup_id": 11 if group == "a" else 22,
+                                     "cgroup_path": f"/synthetic/{group}",
+                                     "verified_cgroup_id": 11 if group == "a" else 22,
+                                     "identity_verification_status": "verified",
+                                     "custom_scheduler_schema_version": "2",
+                                     "expected_group_count": 2,
+                                     "expected_group_config_json": expected_config,
                                      "cgroup_cpu_weight": 100, "cgroup_cpu_max": "max 100000",
                                      "requested_duration_s": 1, "cpu_time_s": cpu,
-                                     "workload_elapsed_s": 2, "exit_status": 0,
+                                     "workload_elapsed_s": 2, "completion_status": "complete",
+                                     "exit_status": 0,
                                      "termination_signal": 0,
                                      "measurement_status": "complete",
                                      "scheduler_attached": "true",
@@ -239,6 +309,55 @@ class RepeatedRunSummaryTests(unittest.TestCase):
             rows, exclusions, _warnings = summary.summarize([str(source)])
             self.assertTrue(any("shutdown" in ";".join(item["reasons"])
                                 for item in exclusions))
+
+    def test_custom_run_integrity_errors_are_excluded(self):
+        summary = load_module()
+        with tempfile.TemporaryDirectory(prefix="synthetic_test_only_") as temp:
+            root = Path(temp)
+            scenarios = []
+            missing = self.custom_rows("missing")[:1]
+            scenarios.append(("missing", missing, "expected group row 'b' is missing"))
+            duplicate = self.custom_rows("duplicate")
+            duplicate.append(dict(duplicate[0]))
+            scenarios.append(("duplicate", duplicate, "expected group row 'a' is duplicated"))
+            mismatch = self.custom_rows("mismatch")
+            mismatch[1]["group_share"] = 200
+            scenarios.append(("mismatch", mismatch, "configured share mismatch for group 'b'"))
+            identity_mismatch = self.custom_rows("identity_mismatch")
+            identity_mismatch[1]["verified_cgroup_id"] = 999
+            scenarios.append(("identity_mismatch", identity_mismatch,
+                              "cgroup identity mismatch for group 'b'"))
+            inconsistent = self.custom_rows("inconsistent")
+            config = json.loads(inconsistent[1]["expected_group_config_json"])
+            config["fallback_share"] = 40
+            inconsistent[1]["expected_group_config_json"] = json.dumps(
+                config, sort_keys=True, separators=(",", ":"))
+            scenarios.append(("inconsistent", inconsistent,
+                              "expected group configuration differs between result rows"))
+            malformed = self.custom_rows("malformed")
+            for row in malformed:
+                row["expected_group_config_json"] = json.dumps({"groups": "invalid"})
+            scenarios.append(("malformed", malformed,
+                              "expected groups configuration is missing or invalid"))
+            legacy = self.custom_rows("legacy")
+            for row in legacy:
+                row.pop("expected_group_config_json")
+                row.pop("expected_group_count")
+                row.pop("custom_scheduler_schema_version")
+            scenarios.append(("legacy", legacy,
+                              "legacy custom-scheduler result lacks expected-group configuration metadata"))
+            incomplete = self.custom_rows("incomplete")
+            incomplete[1]["measurement_status"] = "incomplete"
+            incomplete[1]["cpu_time_s"] = "NA"
+            scenarios.append(("incomplete", incomplete, "measurement_status is incomplete"))
+
+            for name, rows, expected_reason in scenarios:
+                source = root / f"{name}.csv"
+                self.write_custom_csv(source, rows)
+                _summary, exclusions, _warnings = summary.summarize([str(source)])
+                self.assertEqual(len(exclusions), 1, name)
+                self.assertTrue(any(expected_reason in reason
+                                    for reason in exclusions[0]["reasons"]), name)
 
     def test_incomplete_and_missing_counter_runs_are_excluded_with_reasons(self):
         summary = load_module()

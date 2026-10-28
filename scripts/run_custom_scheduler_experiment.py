@@ -21,6 +21,7 @@ import prepare_custom_scheduler_experiment as preparation
 
 
 READY_LINE = "GROUP_SCHEDULER_ATTACHED"
+CUSTOM_SCHEDULER_SCHEMA_VERSION = "2"
 RESULT_FIELDS = [
     "run_id", "timestamp_utc", "group", "cgroup_id", "cgroup_path",
     "kernel_version", "logical_cpu_count", "architecture", "worker_executable",
@@ -30,6 +31,8 @@ RESULT_FIELDS = [
     "requested_duration_s", "workload_elapsed_s", "cpu_time_s", "exit_status",
     "termination_signal", "completion_status", "measurement_status",
     "measurement_error", "scheduler_attached", "scheduler_shutdown_status",
+    "custom_scheduler_schema_version", "expected_group_count",
+    "expected_group_config_json",
 ]
 
 
@@ -96,6 +99,19 @@ def validate_groups(groups, fallback_share):
 
 def verify_groups(groups, verifier=preparation.verify_group_identity):
     return [verifier(group) for group in groups]
+
+
+def _expected_group_config(groups, fallback_share):
+    return {
+        "expected_group_count": len(groups),
+        "fallback_share": fallback_share,
+        "groups": [{
+            "name": group["name"],
+            "cgroup_id": group["cgroup_id"],
+            "cgroup_path": group["path"],
+            "share": group["share"],
+        } for group in groups],
+    }
 
 
 def _check_cgroup_write_permission(path):
@@ -186,6 +202,7 @@ def _reserve_outputs(output_dir, mode):
 
 def _manifest(run_id, mode, groups, fallback_share, duration, csv_path, log_path,
               worker_path):
+    expected_config = _expected_group_config(groups, fallback_share)
     return {
         "run_id": run_id, "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "mode": mode, "scheduler_attached": False,
@@ -203,6 +220,9 @@ def _manifest(run_id, mode, groups, fallback_share, duration, csv_path, log_path
             "cgroup_cpu_max": preparation.read_control(g["path"], "cpu.max"),
         } for g in groups],
         "fallback_scheduler_share": fallback_share,
+        "custom_scheduler_schema_version": CUSTOM_SCHEDULER_SCHEMA_VERSION,
+        "expected_group_count": len(groups),
+        "expected_group_config": expected_config,
         "workload": {"worker_executable": str(worker_path),
                      "worker_type": "synthetic CPU-bound worker",
                      "duration_s": duration},
@@ -218,6 +238,8 @@ def _manifest(run_id, mode, groups, fallback_share, duration, csv_path, log_path
 def _write_csv(path, run_id, groups, fallback_share, duration, status, error="",
                attached=False, shutdown="not_started", rows=None, worker_path=None):
     rows = rows or {}
+    expected_config_json = json.dumps(
+        _expected_group_config(groups, fallback_share), sort_keys=True, separators=(",", ":"))
     with path.open("w", newline="", encoding="utf-8") as stream:
         writer = csv.DictWriter(stream, fieldnames=RESULT_FIELDS)
         writer.writeheader()
@@ -250,6 +272,9 @@ def _write_csv(path, run_id, groups, fallback_share, duration, status, error="",
                 "measurement_error": measured.get("measurement_error", error),
                 "scheduler_attached": str(attached).lower(),
                 "scheduler_shutdown_status": shutdown,
+                "custom_scheduler_schema_version": CUSTOM_SCHEDULER_SCHEMA_VERSION,
+                "expected_group_count": len(groups),
+                "expected_group_config_json": expected_config_json,
             })
 
 

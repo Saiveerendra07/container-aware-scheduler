@@ -30,8 +30,12 @@ python3 scripts/evaluate_fairness.py results/raw/custom_group_run.csv \
   --output results/processed/custom_group_fairness.csv
 ```
 
-The custom scheduler runner also writes `group_share` on each raw result row,
-so completed custom scheduler CSVs can be evaluated directly with this tool.
+The custom scheduler runner writes `group_share` and `fallback_share` on each
+row plus a versioned expected-group configuration containing all group names,
+cgroup IDs/paths, shares, and the expected count. The evaluator checks the row
+set against that configuration before computing any custom-scheduler metrics.
+Legacy custom-scheduler CSVs without this metadata are reported as unavailable
+rather than inferring the configured group set from observed rows.
 
 The repository's existing group runner records `group_counts`, which are
 worker counts, not configured shares. That format can still supply observed
@@ -46,11 +50,10 @@ output is excluded because it is not a run, and an incomplete `run` is excluded
 because its measurement status is not complete. Use `scripts/analyze_results.py`
 for the repository's group/cgroup competition schemas; use this evaluator for
 share-weighted custom-scheduler allocation analysis.
-With only per-row share columns, the evaluator can identify configured groups
-that have no measurement only if the CSV also includes a complete
-`group_shares` / `configured_group_shares` mapping. Otherwise the configured
-group set is inferred from represented rows; use a complete mapping when a
-missing whole group must be detected.
+For other group-result schemas, per-row shares alone do not identify a group
+that is entirely missing from the CSV; include a complete
+`group_shares` / `configured_group_shares` mapping when those formats must be
+validated for missing configured groups.
 
 ## Metrics and exclusions
 
@@ -81,12 +84,11 @@ two eligible groups or when their CPU times are all zero.
 
 Only rows with `measurement_status=complete` are eligible. Cgroup rows must
 also have exit status zero, complete `cpu_stat_status`, and valid non-reset
-usage snapshots. A group with any invalid or incomplete measurement is
-excluded as a whole because its aggregate CPU time would be incomplete. Output
-rows report excluded counts and reasons; weighted metrics are unavailable for
-the entire run if any group is excluded. Jain's index may still be reported
-for the remaining eligible groups, and `jain_group_count` makes that scope
-explicit. Malformed input rows/files generate warnings on standard error.
+usage snapshots. A group with any invalid or incomplete measurement excludes
+the entire run from CPU-time, observed-allocation, Jain, and weighted-allocation
+metrics; otherwise those run-level metrics could describe only a partial set
+of groups. Output rows retain per-group exclusion reasons and mark derived
+metrics `NA`. Malformed input rows/files generate warnings on standard error.
 
 ## Test data
 

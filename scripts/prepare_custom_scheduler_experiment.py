@@ -231,7 +231,7 @@ def prepare(groups, output_dir, duration):
                     "exit_status": "NA",
                     "completion_status": "not_started",
                     "measurement_status": "not_run_prepared",
-                    "measurement_error": "run mode unavailable: the experiment harness has not integrated the pre-exec supervisor mode",
+                    "measurement_error": "",
                 })
         metadata = {
             "run_id": run_id,
@@ -251,7 +251,7 @@ def prepare(groups, output_dir, duration):
             } for g in verified_groups],
             "scheduler_share_map": share_map,
             "controls_note": "cpu.weight and cpu.max are read-only cgroup controls; they are not scheduler shares.",
-            "runtime_blocker": "This tool verifies cgroup identities but remains preparation-only; it does not attach the scheduler or run workloads.",
+            "runtime_blocker": "This command only prepares records; use run_custom_scheduler_experiment.py run for explicit runtime execution.",
         }
         with metadata_path.open("w", encoding="utf-8") as stream:
             json.dump(metadata, stream, indent=2)

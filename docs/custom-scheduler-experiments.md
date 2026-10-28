@@ -122,10 +122,20 @@ its fallback policy between a scheduler failure and userspace detection; such
 a run is explicitly invalid and cannot be interpreted as custom-scheduler
 allocation evidence.
 
-The CSV columns `group_share` and `fallback_share` are custom scheduler
-configuration. `cgroup_cpu_weight` and `cgroup_cpu_max` are recorded separately
-and are never applied by this runner. `scripts/evaluate_fairness.py` accepts
-completed rows directly; prepared/incomplete rows are excluded:
+Custom scheduler result CSVs use schema version 2. Every row repeats
+`custom_scheduler_schema_version`, `expected_group_count`, and
+`expected_group_config_json`. The JSON object records the complete expected
+group list (name, cgroup ID, cgroup path, and configured share), expected count,
+and fallback share. Each row also records its own group identity/share and
+`fallback_share`; the evaluator verifies these against the run configuration,
+requires exactly one row for every expected group, and rejects duplicate,
+missing, unexpected, or inconsistent rows. `cgroup_cpu_weight` and
+`cgroup_cpu_max` are recorded separately and are never applied by this runner.
+
+Older custom-scheduler CSVs without the v2 configuration are still parsed for
+diagnostics, but are explicitly excluded from CPU/fairness conclusions because
+the complete expected group set cannot be reconstructed safely. Prepared and
+incomplete rows are also excluded:
 
 ```sh
 python3 scripts/evaluate_fairness.py results/raw/custom_scheduler_run.csv \

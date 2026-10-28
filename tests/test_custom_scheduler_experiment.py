@@ -72,10 +72,13 @@ class CustomSchedulerExperimentTests(unittest.TestCase):
             self.assertTrue(all(row["cgroup_cpu_max"] == "max 100000" for row in rows))
             self.assertTrue(all(row["measurement_status"] == "not_run_prepared" for row in rows))
             self.assertTrue(all(row["cpu_time_s"] == "NA" for row in rows))
+            self.assertTrue(all(row["measurement_error"] == "" for row in rows))
             self.assertTrue(all(row["verified_cgroup_id"] == row["cgroup_id"] for row in rows))
             self.assertTrue(all(row["identity_verification_status"] == "verified" for row in rows))
             self.assertTrue(metadata_path.exists())
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            self.assertIn("run_custom_scheduler_experiment.py run",
+                          metadata["runtime_blocker"])
             self.assertTrue(all(group["identity_verification_status"] == "verified"
                                 for group in metadata["scheduler_groups"]))
 
