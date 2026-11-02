@@ -46,10 +46,12 @@ class CgroupPlacementSupervisorTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def run_supervisor(self, cgroup, binary=None):
+    def run_supervisor(self, cgroup, binary=None, extra_env=None):
         env = os.environ.copy()
         env["CGROUP_PROCS"] = str(cgroup / "cgroup.procs")
         env["PLACEMENT_OBSERVED"] = str(self.root / "worker-observed-members")
+        if extra_env:
+            env.update(extra_env)
         return subprocess.run(
             [str(binary or self.binary), "--cgroup", str(cgroup), str(self.metadata),
              str(self.worker), "1", str(self.cancel)],
@@ -76,6 +78,16 @@ class CgroupPlacementSupervisorTests(unittest.TestCase):
         self.assertEqual(result.returncode, 125)
         self.assertFalse((self.root / "worker-observed-members").exists())
         self.assertIn("cgroup", result.stderr)
+
+    def test_stale_runner_parent_fails_before_workload_can_start(self):
+        cgroup = self.root / "delegated-group"
+        cgroup.mkdir()
+        (cgroup / "cgroup.procs").write_text("", encoding="ascii")
+        result = self.run_supervisor(
+            cgroup, extra_env={"CAS_PARENT_PID": str(os.getpid() + 100000)})
+        self.assertEqual(result.returncode, 125)
+        self.assertFalse((self.root / "worker-observed-members").exists())
+        self.assertIn("parent lifecycle guard", result.stderr)
 
     def test_production_mode_rejects_an_ordinary_directory_as_cgroup(self):
         cgroup = self.root / "ordinary-directory"

@@ -21,6 +21,11 @@ import prepare_custom_scheduler_experiment as preparation
 
 
 READY_LINE = "GROUP_SCHEDULER_ATTACHED"
+PARENT_PID_ENV = "CAS_PARENT_PID"
+SUPERVISOR_TERM_TIMEOUT = 5
+SUPERVISOR_KILL_TIMEOUT = 3
+LOADER_TERM_TIMEOUT = 10
+LOADER_KILL_TIMEOUT = 5
 CUSTOM_SCHEDULER_SCHEMA_VERSION = "2"
 RESULT_FIELDS = [
     "run_id", "timestamp_utc", "group", "cgroup_id", "cgroup_path",
@@ -349,25 +354,36 @@ def _supervisor_metadata(path):
             "measurement_error": ""}
 
 
-def _stop_loader(process, timeout=10):
+def _stop_loader(process):
     if process.poll() is not None:
         return "exited" if process.returncode == 0 else f"exit_{process.returncode}"
+    signal_errors = []
     try:
         process.send_signal(signal.SIGTERM)
     except ProcessLookupError:
-        process.wait()
-        return "exited" if process.returncode == 0 else f"exit_{process.returncode}"
+        pass
+    except OSError as exc:
+        signal_errors.append(f"SIGTERM_error_{exc.errno}")
     try:
-        process.wait(timeout=timeout)
+        process.wait(timeout=LOADER_TERM_TIMEOUT)
     except subprocess.TimeoutExpired:
         # Keep the runner alive until the loader can report its link teardown.
         # Exiting while it still owns the link could leave sched_ext active.
         try:
-            process.send_signal(signal.SIGTERM)
+            process.send_signal(signal.SIGKILL)
         except ProcessLookupError:
             pass
-        process.wait()
-    return "stopped" if process.returncode == 0 else f"exit_{process.returncode}"
+        except OSError as exc:
+            signal_errors.append(f"SIGKILL_error_{exc.errno}")
+        try:
+            process.wait(timeout=LOADER_KILL_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            status = f"kill_timeout_pid_{getattr(process, 'pid', 'unknown')}"
+            return ";".join([status, *signal_errors])
+        status = f"killed_exit_{process.returncode}"
+        return ";".join([status, *signal_errors])
+    status = "stopped" if process.returncode == 0 else f"exit_{process.returncode}"
+    return ";".join([status, *signal_errors])
 
 
 def _signal_supervisor(process):
@@ -375,6 +391,43 @@ def _signal_supervisor(process):
         process.send_signal(signal.SIGTERM)
     except ProcessLookupError:
         pass
+
+
+def _stop_supervisors(supervisors):
+    failures = []
+    for group, process in supervisors:
+        if process.poll() is None:
+            signal_errors = []
+            try:
+                process.send_signal(signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            except OSError as exc:
+                signal_errors.append(f"SIGTERM_error_{exc.errno}")
+            try:
+                process.wait(timeout=SUPERVISOR_TERM_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                try:
+                    process.send_signal(signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                except OSError as exc:
+                    signal_errors.append(f"SIGKILL_error_{exc.errno}")
+                try:
+                    process.wait(timeout=SUPERVISOR_KILL_TIMEOUT)
+                except subprocess.TimeoutExpired:
+                    signal_detail = (f" ({', '.join(signal_errors)})"
+                                     if signal_errors else "")
+                    failures.append(
+                        f"supervisor {group['name']} kill timeout pid "
+                        f"{getattr(process, 'pid', 'unknown')}" + signal_detail)
+                    continue
+            failures.extend(
+                f"supervisor {group['name']} {error}" for error in signal_errors)
+        if process.returncode != 0:
+            failures.append(
+                f"supervisor {group['name']} exited {process.returncode}")
+    return failures
 
 
 def run_experiment(args, groups, *, popen=subprocess.Popen):
@@ -396,12 +449,21 @@ def run_experiment(args, groups, *, popen=subprocess.Popen):
     def request_stop(signum, _frame):
         run_experiment.interrupted = signum
 
-    for signum in (signal.SIGINT, signal.SIGTERM):
+    for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         previous_handlers[signum] = signal.signal(signum, request_stop)
+    child_env = os.environ.copy()
+    child_env[PARENT_PID_ENV] = str(os.getpid())
     try:
+        if run_experiment.interrupted:
+            raise ExperimentError(
+                f"experiment interrupted by signal {run_experiment.interrupted} before loader startup")
         with log_path.open("w", encoding="utf-8") as log:
             loader = popen(_loader_command(args, groups), stdout=subprocess.PIPE,
-                           stderr=log, text=True, bufsize=1, start_new_session=True)
+                           stderr=log, text=True, bufsize=1, start_new_session=True,
+                           env=child_env)
+            if run_experiment.interrupted:
+                raise ExperimentError(
+                    f"experiment interrupted by signal {run_experiment.interrupted} during loader startup")
             _wait_for_ready(loader, args.attach_timeout, log)
             attached = True
             manifest["scheduler_attached"] = True
@@ -423,7 +485,8 @@ def run_experiment(args, groups, *, popen=subprocess.Popen):
                 command = [str(args.supervisor), "--cgroup", group["path"], str(metadata_path),
                            str(args.worker), str(args.duration), str(cancel_path)]
                 supervisors.append((group, popen(command, stdout=log, stderr=log,
-                                                   start_new_session=True)))
+                                                   start_new_session=True,
+                                                   env=child_env)))
             for index, (group, supervisor) in enumerate(supervisors):
                 while supervisor.poll() is None:
                     if loader.poll() is not None:
@@ -442,14 +505,10 @@ def run_experiment(args, groups, *, popen=subprocess.Popen):
                                                 measurement_error=f"supervisor exited {supervisor.returncode}")
     except Exception as exc:
         error = str(exc)
+        stop_failures = _stop_supervisors(supervisors)
+        if stop_failures:
+            error += "; cleanup: " + ", ".join(stop_failures)
         for index, (group, child) in enumerate(supervisors):
-            if child.poll() is None:
-                _signal_supervisor(child)
-        # Wait for each supervisor to finish its own worker cleanup before
-        # detaching the scheduler. No ordinary-scheduler fallback is possible.
-        for index, (group, child) in enumerate(supervisors):
-            if child.poll() is None:
-                child.wait()
             if index < len(metadata_files):
                 try:
                     rows[group["name"]] = _supervisor_metadata(metadata_files[index])
@@ -463,8 +522,9 @@ def run_experiment(args, groups, *, popen=subprocess.Popen):
             shutdown = _stop_loader(loader)
             if loader.stdout is not None:
                 loader.stdout.close()
-            if shutdown != "stopped" and not error:
-                error = f"scheduler shutdown did not complete cleanly: {shutdown}"
+            if shutdown != "stopped":
+                shutdown_error = f"scheduler shutdown did not complete cleanly: {shutdown}"
+                error = "; ".join(filter(None, (error, shutdown_error)))
         for path in metadata_files + cancel_files:
             path.unlink(missing_ok=True)
         for signum, handler in previous_handlers.items():

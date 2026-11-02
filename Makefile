@@ -95,13 +95,14 @@ $(BUILD_DIR)/group_scheduler.skel.h: $(BUILD_DIR)/group_scheduler.bpf.o
 	$(BPFTOOL) gen skeleton "$<" name group_scheduler > "$@"
 
 $(BUILD_DIR)/group_scheduler: src/group_scheduler.c \
-		include/group_scheduler.h $(BUILD_DIR)/group_scheduler.skel.h | check-deps
+		include/group_scheduler.h include/process_lifecycle.h \
+		$(BUILD_DIR)/group_scheduler.skel.h | check-deps
 	$(CC) $(USER_CFLAGS) "$<" -o "$@" $(USER_LIBS)
 
 $(BUILD_DIR)/cpu_worker: workloads/cpu_worker.c | $(BUILD_DIR)
 	$(CC) -O2 -Wall -Wextra -Werror -std=c11 "$<" -o "$@"
 
-$(BUILD_DIR)/cpu_supervisor: workloads/cpu_supervisor.c | $(BUILD_DIR)
+$(BUILD_DIR)/cpu_supervisor: workloads/cpu_supervisor.c include/process_lifecycle.h | $(BUILD_DIR)
 	$(CC) -O2 -Wall -Wextra -Werror -std=c11 "$<" -o "$@"
 
 clean:

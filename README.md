@@ -140,7 +140,7 @@ than the custom scheduler.
 From the repository root, inspect the available files and script interfaces:
 
 ```sh
-rg --files
+find . -type f ! -path './.git/*' ! -path './build/*' -print | sort
 bash scripts/run_experiment_suite.sh --help
 bash scripts/run_cgroup_competition.sh --help
 python3 scripts/analyze_results.py --help
@@ -171,17 +171,22 @@ gcc -O2 -Wall -Wextra -std=c11 workloads/cpu_worker.c -o workloads/cpu_worker
 ```
 
 The `make` target builds the **custom scheduler loader**, not the workload. It
-requires Clang with BPF support, `bpftool`, libbpf development files (version
-1.5 or newer), readable kernel BTF, and sched_ext compatibility headers. See
-`docs/scheduler-design.md` before attempting that build. On hosts whose system
-libbpf is older, the runtime validation checklist documents how to build
-libbpf 1.5.0 into a private `/tmp` prefix without replacing system libraries.
+requires Clang with BPF support, `bpftool`, `pkg-config`, libbpf development
+files (version 1.5 or newer), readable kernel BTF, and sched_ext compatibility
+headers. The Makefile defaults to `CLANG=clang` and
+`SCX_ROOT=$HOME/scx-c-examples`; override these when the installed compiler or
+approved reference checkout uses different names or paths. See
+[`docs/build-environment.md`](docs/build-environment.md) for the exact tested
+institute-PC profile and private libbpf setup.
 
 Run the read-only custom-scheduler readiness diagnostic before arranging a
 build or runtime validation:
 
 ```sh
-python3 scripts/check_scheduler_readiness.py
+CLANG=clang-18 \
+PKG_CONFIG_PATH=/tmp/container-aware-scheduler-deps/prefix/lib/pkgconfig \
+python3 scripts/check_scheduler_readiness.py \
+  --scx-root /tmp/container-aware-scheduler-deps/scx-c-examples
 ```
 
 It reports kernel/architecture, BTF, sched_ext state, compiler/tool and libbpf
@@ -193,30 +198,48 @@ classification is only a heuristic, and a clean report does not establish
 that the kernel supports or will accept this scheduler.
 
 For build-only status, independent of whether sched_ext is currently enabled,
-use `python3 scripts/check_scheduler_readiness.py --build-only`. It still
-reports the state interface, but gates its exit status on the BPF and
-userspace build prerequisites.
-
-On the institute Linux host, point `SCX_ROOT` at the already-approved
-`sched-ext/scx-c-examples` reference checkout and record its revision. This
-project does not pin a compatible checkout commit; do not substitute an
-unreviewed upstream revision. If the system libbpf is below 1.5, first follow
-the private `/tmp` build procedure in
-`docs/runtime-validation-checklist.md`. Then run build preflight and build both
-the BPF object and loader:
+use the build-only form, which reports the state interface but gates its exit
+status on the BPF and userspace build prerequisites:
 
 ```sh
-SCX_ROOT="$HOME/scx-c-examples"
-git -C "$SCX_ROOT" rev-parse HEAD
-python3 scripts/check_scheduler_readiness.py --build-only --scx-root "$SCX_ROOT"
-make SCX_ROOT="$SCX_ROOT" VMLINUX_BTF=/sys/kernel/btf/vmlinux
-test -s build/group_scheduler.bpf.o
-test -x build/group_scheduler
+CLANG=clang-18 \
+PKG_CONFIG_PATH=/tmp/container-aware-scheduler-deps/prefix/lib/pkgconfig \
+python3 scripts/check_scheduler_readiness.py --build-only \
+  --scx-root /tmp/container-aware-scheduler-deps/scx-c-examples
 ```
 
-This procedure does not install or update dependencies. A completed scheduler
-build requires both the BPF object and userspace loader checks to pass; a C
-workload build alone is not a scheduler build.
+On the tested institute host, Clang is named `clang-18`, and the approved
+reference checkout is at `/tmp/container-aware-scheduler-deps/scx-c-examples`.
+Use the private libbpf prefix for compilation and later loader execution. The
+loader has no embedded RPATH/RUNPATH: without `LD_LIBRARY_PATH` (or equivalent
+runtime linker configuration), it may load a system `libbpf.so.1` instead of
+the tested private version. These commands create generated artifacts under
+`build/`; they do not attach the scheduler or start workloads:
+
+```sh
+export PRIVATE_PREFIX=/tmp/container-aware-scheduler-deps/prefix
+export SCX_ROOT=/tmp/container-aware-scheduler-deps/scx-c-examples
+export CLANG=clang-18
+export PKG_CONFIG_PATH="$PRIVATE_PREFIX/lib/pkgconfig"
+export LD_LIBRARY_PATH="$PRIVATE_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+git -C "$SCX_ROOT" rev-parse HEAD
+python3 scripts/check_scheduler_readiness.py --build-only --scx-root "$SCX_ROOT"
+make check-deps CLANG=clang-18 SCX_ROOT="$SCX_ROOT" \
+  VMLINUX_BTF=/sys/kernel/btf/vmlinux
+make CLANG=clang-18 SCX_ROOT="$SCX_ROOT" \
+  VMLINUX_BTF=/sys/kernel/btf/vmlinux
+make workloads
+test -s build/group_scheduler.bpf.o
+test -x build/group_scheduler
+test -x build/cpu_worker
+test -x build/cpu_supervisor
+```
+
+This procedure does not install or update dependencies. A successful build or
+BPF ELF/BTF/skeleton inspection confirms compilation and artifact structure
+only; it does not prove verifier acceptance, scheduler attachment, runtime
+correctness, or performance. Keep the private library path in
+`LD_LIBRARY_PATH` when invoking the loader. Do not run it as a build check.
 
 ## Examples
 
@@ -345,13 +368,9 @@ aggregation rules, exclusions, and limits.
 ### Custom scheduler build and future runtime evaluation
 
 Build the loader only on a machine with the required BPF, libbpf, BTF, and
-sched_ext headers:
-
-```sh
-make
-# or, if the sched_ext source tree is elsewhere:
-make SCX_ROOT=/path/to/scx-c-examples
-```
+sched_ext headers. On the tested institute host, use the exact setup and build
+commands in [the environment record](docs/build-environment.md); bare `make`
+uses the Makefile defaults and is not the reproducible command for that host.
 
 This build does not attach the scheduler. Running `build/group_scheduler`
 would explicitly load and attach sched_ext and requires a compatible kernel,

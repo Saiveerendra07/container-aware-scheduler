@@ -124,6 +124,35 @@ class CustomSchedulerRunnerTests(unittest.TestCase):
                 "closed its output before attachment readiness",
             )))
 
+    def test_signal_before_loader_startup_does_not_launch_a_process(self):
+        runner = load_runner()
+        with tempfile.TemporaryDirectory(prefix="synthetic_test_only_") as temp:
+            root = Path(temp)
+            groups = self.setup_groups(root, runner)
+            loader = executable(root / "loader", "raise SystemExit(0)\n")
+            args = SimpleNamespace(output_dir=root / "out", fallback_share=50, duration=1,
+                                   loader=loader, worker=root / "worker", attach_timeout=1)
+            original_signal = signal.signal
+            fired = [False]
+
+            def signal_then_stop(signum, handler):
+                previous = original_signal(signum, handler)
+                if signum == signal.SIGHUP and handler is not None and not fired[0]:
+                    fired[0] = True
+                    handler(signum, None)
+                return previous
+
+            with mock.patch.object(runner.signal, "signal", side_effect=signal_then_stop):
+                status = runner.run_experiment(
+                    args, groups,
+                    popen=lambda *_args, **_kwargs: self.fail("Popen must not be called"))
+            self.assertEqual(status, 1)
+            manifest = json.loads(next((root / "out").glob("*.json")).read_text())
+            rows = self.read_rows(next((root / "out").glob("*.csv")))
+            self.assertIn("before loader startup", manifest["error"])
+            self.assertTrue(all(row["scheduler_attached"] == "false" for row in rows))
+            self.assertTrue(all(row["measurement_status"] == "incomplete" for row in rows))
+
     def test_partial_readiness_output_cannot_bypass_attach_timeout(self):
         runner = load_runner()
         with tempfile.TemporaryDirectory(prefix="synthetic_test_only_") as temp:
@@ -234,6 +263,54 @@ while True: time.sleep(.02)
             manifest = json.loads(next((root / "out").glob("*.json")).read_text())
             self.assertIn("signal", manifest["error"])
 
+    def test_sighup_during_run_records_incomplete_and_reaps_processes(self):
+        runner = load_runner()
+        with tempfile.TemporaryDirectory(prefix="synthetic_test_only_") as temp:
+            root = Path(temp)
+            groups = self.setup_groups(root, runner)
+            loader = executable(root / "loader", """
+import signal, time
+signal.signal(signal.SIGTERM, lambda *_: exit(0))
+print('GROUP_SCHEDULER_ATTACHED', flush=True)
+while True: time.sleep(.02)
+""")
+            supervisor = executable(root / "supervisor", """
+import pathlib, signal, sys, time
+metadata = pathlib.Path(sys.argv[3])
+def stop(*_):
+    metadata.write_text('123\\tNA\\tNA\\tNA\\tNA\\t15\\t0\\t0\\n')
+    sys.exit(143)
+signal.signal(signal.SIGTERM, stop)
+while True: time.sleep(.02)
+""")
+            launched = []
+            real_popen = subprocess.Popen
+
+            def capture(command, **kwargs):
+                child = real_popen(command, **kwargs)
+                launched.append(child)
+                return child
+
+            real_sleep = time.sleep
+            sent = [False]
+
+            def interrupt_once(seconds):
+                real_sleep(min(seconds, .02))
+                if not sent[0]:
+                    sent[0] = True
+                    os.kill(os.getpid(), signal.SIGHUP)
+
+            args = SimpleNamespace(output_dir=root / "out", fallback_share=50, duration=5,
+                                   loader=loader, worker=root / "worker", supervisor=supervisor,
+                                   attach_timeout=2)
+            with mock.patch.object(runner.time, "sleep", side_effect=interrupt_once):
+                self.assertEqual(runner.run_experiment(args, groups, popen=capture), 1)
+            self.assertTrue(all(child.poll() is not None for child in launched))
+            rows = self.read_rows(next((root / "out").glob("*.csv")))
+            self.assertTrue(all(row["measurement_status"] == "incomplete" for row in rows))
+            manifest = json.loads(next((root / "out").glob("*.json")).read_text())
+            self.assertIn("signal", manifest["error"])
+
     def test_sigint_during_run_records_incomplete_and_reaps_processes(self):
         runner = load_runner()
         with tempfile.TemporaryDirectory(prefix="synthetic_test_only_") as temp:
@@ -325,7 +402,18 @@ metadata.write_text('123\\t1000000000\\t1000000\\t500000\\t0\\t0\\t0\\t0\\n')
             args = SimpleNamespace(output_dir=root / "out", fallback_share=50, duration=1.0,
                                    loader=loader, worker=worker, supervisor=supervisor,
                                    attach_timeout=2)
-            self.assertEqual(runner.run_experiment(args, groups), 0)
+            child_environments = []
+            real_popen = subprocess.Popen
+
+            def capture_environment(command, **kwargs):
+                child_environments.append(kwargs["env"])
+                return real_popen(command, **kwargs)
+
+            self.assertEqual(runner.run_experiment(args, groups,
+                                                   popen=capture_environment), 0)
+            self.assertTrue(child_environments)
+            self.assertTrue(all(environment[runner.PARENT_PID_ENV] == str(os.getpid())
+                                for environment in child_environments))
             csv_path = next((root / "out").glob("*.csv"))
             spec = importlib.util.spec_from_file_location("test_fairness_evaluator", EVALUATOR_PATH)
             evaluator = importlib.util.module_from_spec(spec); spec.loader.exec_module(evaluator)
@@ -362,6 +450,97 @@ metadata.write_text('123\\t1000000000\\t1000000\\t500000\\t0\\t0\\t0\\t0\\n')
             self.assertTrue(all(row["expected_group_config_json"]
                                 == first_rows[0]["expected_group_config_json"]
                                 for row in first_rows))
+
+    def test_loader_shutdown_timeout_is_bounded_and_reports_pid(self):
+        runner = load_runner()
+
+        class StuckProcess:
+            pid = 43210
+            returncode = None
+
+            def __init__(self):
+                self.signals = []
+                self.wait_timeouts = []
+
+            def poll(self):
+                return None
+
+            def send_signal(self, signum):
+                self.signals.append(signum)
+
+            def wait(self, timeout=None):
+                self.wait_timeouts.append(timeout)
+                raise subprocess.TimeoutExpired("fake-loader", timeout)
+
+        process = StuckProcess()
+        status = runner._stop_loader(process)
+        self.assertEqual(status, "kill_timeout_pid_43210")
+        self.assertEqual(process.signals, [signal.SIGTERM, signal.SIGKILL])
+        self.assertEqual(process.wait_timeouts,
+                         [runner.LOADER_TERM_TIMEOUT, runner.LOADER_KILL_TIMEOUT])
+
+    def test_loader_shutdown_timeout_is_written_to_manifest(self):
+        runner = load_runner()
+        with tempfile.TemporaryDirectory(prefix="synthetic_test_only_") as temp:
+            root = Path(temp)
+            groups = self.setup_groups(root, runner)
+            loader = executable(root / "loader", """
+import signal, time
+signal.signal(signal.SIGTERM, lambda *_: exit(0))
+print('GROUP_SCHEDULER_ATTACHED', flush=True)
+while True: time.sleep(.02)
+""")
+            supervisor = executable(root / "supervisor", """
+import pathlib, sys
+pathlib.Path(sys.argv[3]).write_text('123\\t1000000000\\t1000000\\t500000\\t0\\t0\\t0\\t0\\n')
+""")
+            args = SimpleNamespace(output_dir=root / "out", fallback_share=50, duration=0.1,
+                                   loader=loader, worker=root / "worker", supervisor=supervisor,
+                                   attach_timeout=2)
+            stop_loader = runner._stop_loader
+
+            def stop_but_report_timeout(process):
+                self.assertEqual(stop_loader(process), "stopped")
+                return "kill_timeout_pid_43210"
+
+            with mock.patch.object(runner, "_stop_loader",
+                                   side_effect=stop_but_report_timeout):
+                self.assertEqual(runner.run_experiment(args, groups), 1)
+            manifest = json.loads(next((root / "out").glob("*.json")).read_text())
+            rows = self.read_rows(next((root / "out").glob("*.csv")))
+            self.assertEqual(manifest["scheduler_shutdown_status"],
+                             "kill_timeout_pid_43210")
+            self.assertIn("kill_timeout_pid_43210", manifest["error"])
+            self.assertTrue(all(row["measurement_status"] == "incomplete" for row in rows))
+
+    def test_supervisor_shutdown_timeout_is_bounded_and_reports_pid(self):
+        runner = load_runner()
+
+        class StuckProcess:
+            pid = 54321
+            returncode = None
+
+            def __init__(self):
+                self.signals = []
+                self.wait_timeouts = []
+
+            def poll(self):
+                return None
+
+            def send_signal(self, signum):
+                self.signals.append(signum)
+
+            def wait(self, timeout=None):
+                self.wait_timeouts.append(timeout)
+                raise subprocess.TimeoutExpired("fake-supervisor", timeout)
+
+        process = StuckProcess()
+        failures = runner._stop_supervisors([({"name": "alpha"}, process)])
+        self.assertEqual(process.signals, [signal.SIGTERM, signal.SIGKILL])
+        self.assertEqual(process.wait_timeouts,
+                         [runner.SUPERVISOR_TERM_TIMEOUT,
+                          runner.SUPERVISOR_KILL_TIMEOUT])
+        self.assertIn("alpha kill timeout pid 54321", failures[0])
 
 
 if __name__ == "__main__":

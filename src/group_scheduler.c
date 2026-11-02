@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 #include <bpf/libbpf.h>
@@ -14,6 +15,7 @@
 
 #include "group_scheduler.h"
 #include "group_scheduler.skel.h"
+#include "process_lifecycle.h"
 
 static volatile sig_atomic_t exit_requested;
 static bool verbose;
@@ -22,6 +24,20 @@ static void handle_signal(int signal_number)
 {
 	(void)signal_number;
 	exit_requested = 1;
+}
+
+static bool termination_requested(void)
+{
+	sigset_t pending;
+
+	if (exit_requested)
+		return true;
+	if (sigpending(&pending) == -1) {
+		perror("sigpending");
+		return true;
+	}
+	return sigismember(&pending, SIGINT) == 1 ||
+	       sigismember(&pending, SIGTERM) == 1;
 }
 
 static int libbpf_print(enum libbpf_print_level level, const char *format,
@@ -119,6 +135,9 @@ int main(int argc, char **argv)
 	struct sigaction action = {
 		.sa_handler = handle_signal,
 	};
+	sigset_t termination_signals;
+	sigset_t previous_signal_mask;
+	bool attach_signals_blocked = false;
 	bool fallback_share_set = false;
 	uint64_t fallback_share;
 	int load_error;
@@ -129,6 +148,10 @@ int main(int argc, char **argv)
 	if (sigaction(SIGINT, &action, NULL) ||
 	    sigaction(SIGTERM, &action, NULL)) {
 		perror("sigaction");
+		return EXIT_FAILURE;
+	}
+	if (process_lifecycle_arm_parent_death() == -1) {
+		perror("parent lifecycle guard");
 		return EXIT_FAILURE;
 	}
 
@@ -171,6 +194,11 @@ int main(int argc, char **argv)
 		return EXIT_FAILURE;
 	}
 	config.total_share += fallback_share;
+	if (termination_requested()) {
+		fprintf(stderr, "Termination requested before BPF startup\n");
+		ret = EXIT_SUCCESS;
+		goto out;
+	}
 
 	skel = SCX_OPS_OPEN(group_scheduler_ops, group_scheduler);
 	if (!skel) {
@@ -183,6 +211,11 @@ int main(int argc, char **argv)
 	memcpy(skel->rodata->scheduler_config.groups, config.groups,
 	       sizeof(config.groups));
 
+	if (termination_requested()) {
+		fprintf(stderr, "Termination requested before BPF load\n");
+		ret = EXIT_SUCCESS;
+		goto out;
+	}
 	UEI_SET_SIZE(skel, group_scheduler_ops, uei);
 	load_error = group_scheduler__load(skel);
 	if (load_error) {
@@ -190,8 +223,32 @@ int main(int argc, char **argv)
 			strerror(-load_error));
 		goto out;
 	}
+	if (termination_requested()) {
+		fprintf(stderr, "Termination requested before scheduler attachment\n");
+		ret = EXIT_SUCCESS;
+		goto out;
+	}
 
+	sigemptyset(&termination_signals);
+	sigaddset(&termination_signals, SIGINT);
+	sigaddset(&termination_signals, SIGTERM);
+	if (sigprocmask(SIG_BLOCK, &termination_signals,
+			&previous_signal_mask) == -1) {
+		perror("blocking termination signals for attachment");
+		goto out;
+	}
+	attach_signals_blocked = true;
+	if (termination_requested()) {
+		fprintf(stderr, "Termination requested immediately before attachment\n");
+		ret = EXIT_SUCCESS;
+		goto out;
+	}
 	link = bpf_map__attach_struct_ops(skel->maps.group_scheduler_ops);
+	if (sigprocmask(SIG_SETMASK, &previous_signal_mask, NULL) == -1) {
+		perror("restoring termination signals after attachment");
+		goto out;
+	}
+	attach_signals_blocked = false;
 	if (!link || libbpf_get_error(link)) {
 		long link_error = link ? -libbpf_get_error(link) :
 					 (errno ? errno : EIO);
@@ -201,17 +258,28 @@ int main(int argc, char **argv)
 		link = NULL;
 		goto out;
 	}
+	fprintf(stderr, "Scheduler attachment succeeded\n");
+	ret = EXIT_SUCCESS;
+	if (termination_requested()) {
+		fprintf(stderr,
+			"Termination requested during attachment; detaching before readiness\n");
+		goto out;
+	}
 	/* The experiment runner waits for this exact line before releasing workers. */
 	if (puts("GROUP_SCHEDULER_ATTACHED") == EOF || fflush(stdout) == EOF) {
 		fprintf(stderr, "Failed to report scheduler attachment readiness\n");
+		ret = EXIT_FAILURE;
 		goto out;
 	}
 
 	while (!exit_requested && !UEI_EXITED(skel, uei))
 		sleep(1);
-
-	ret = EXIT_SUCCESS;
 out:
+	if (attach_signals_blocked &&
+	    sigprocmask(SIG_SETMASK, &previous_signal_mask, NULL) == -1) {
+		perror("restoring termination signals during cleanup");
+		ret = EXIT_FAILURE;
+	}
 	if (link) {
 		int destroy_error = bpf_link__destroy(link);
 
@@ -219,13 +287,17 @@ out:
 			fprintf(stderr, "Failed to destroy scheduler link: %s\n",
 				strerror(-destroy_error));
 			ret = EXIT_FAILURE;
+		} else {
+			fprintf(stderr, "Scheduler link destroyed successfully\n");
 		}
+		link = NULL;
 	}
 	if (skel && skel->data && UEI_EXITED(skel, uei)) {
 		exit_code = UEI_REPORT(skel, uei);
 		if (exit_code)
 			ret = EXIT_FAILURE;
 	}
-	group_scheduler__destroy(skel);
+	if (skel)
+		group_scheduler__destroy(skel);
 	return ret;
 }

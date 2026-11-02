@@ -18,6 +18,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "../include/process_lifecycle.h"
+
 static volatile sig_atomic_t caught_signal;
 static volatile sig_atomic_t signal_count;
 
@@ -37,6 +39,20 @@ static void record_signal(int signal_number)
         signal_count++;
     }
     errno = saved_errno;
+}
+
+static int termination_signal_pending(void)
+{
+    sigset_t pending;
+
+    if (caught_signal != 0) {
+        return 1;
+    }
+    if (sigpending(&pending) == -1) {
+        return -1;
+    }
+    return sigismember(&pending, SIGINT) == 1
+        || sigismember(&pending, SIGTERM) == 1;
 }
 
 static int set_close_on_exec(int fd)
@@ -682,6 +698,7 @@ int main(int argc, char **argv)
     int release_pipe[2] = {-1, -1};
     int cgroup_directory_fd = -1;
     int cgroup_procs_fd = -1;
+    pid_t supervisor_pid = getpid();
 
     if (pipe(exec_pipe) == -1) {
         int error_number = errno;
@@ -730,6 +747,27 @@ int main(int argc, char **argv)
         (void)write_failure_metadata(metadata_path, error_number);
         fprintf(stderr, "cpu_supervisor: sigaction: %s\n",
                 strerror(error_number));
+        return 125;
+    }
+
+    if (process_lifecycle_arm_parent_death() == -1) {
+        int error_number = errno;
+        close(exec_pipe[0]);
+        close(exec_pipe[1]);
+        (void)sigprocmask(SIG_SETMASK, &original_mask, NULL);
+        (void)write_failure_metadata(metadata_path, error_number);
+        fprintf(stderr, "cpu_supervisor: parent lifecycle guard: %s\n",
+                strerror(error_number));
+        return 125;
+    }
+    int pending_signal = termination_signal_pending();
+    if (pending_signal != 0) {
+        int error_number = pending_signal < 0 && errno != 0 ? errno : EINTR;
+        close(exec_pipe[0]);
+        close(exec_pipe[1]);
+        (void)sigprocmask(SIG_SETMASK, &original_mask, NULL);
+        (void)write_failure_metadata(metadata_path, error_number);
+        fprintf(stderr, "cpu_supervisor: termination requested before worker setup\n");
         return 125;
     }
 
@@ -802,7 +840,14 @@ int main(int argc, char **argv)
         sigemptyset(&default_action.sa_mask);
         (void)sigaction(SIGINT, &default_action, NULL);
         (void)sigaction(SIGTERM, &default_action, NULL);
+        if (process_lifecycle_set_parent_death(supervisor_pid) == -1) {
+            struct child_error child_failure = {1, errno};
+            (void)write_all(exec_pipe[1], &child_failure,
+                            sizeof(child_failure));
+            _exit(125);
+        }
         (void)sigprocmask(SIG_SETMASK, &original_mask, NULL);
+        (void)unsetenv(PROCESS_PARENT_PID_ENV);
 
         if (setpgid(0, 0) == -1) {
             struct child_error child_failure = {1, errno};
@@ -875,6 +920,21 @@ int main(int argc, char **argv)
             (void)write_failure_metadata(metadata_path, placement_error);
             fprintf(stderr, "cpu_supervisor: cgroup placement/verification: %s\n",
                     strerror(placement_error));
+            return 125;
+        }
+        int pending_signal = termination_signal_pending();
+        if (pending_signal != 0) {
+            int error_number = pending_signal < 0 && errno != 0 ? errno : EINTR;
+            close(release_pipe[1]);
+            release_pipe[1] = -1;
+            struct rusage ignored_usage;
+            int ignored_status;
+            int wait_error = 0;
+            (void)wait_for_worker(worker_pid, &ignored_status, &ignored_usage,
+                                  &wait_error, cancel_path, SIGTERM,
+                                  worker_group_ready);
+            (void)write_failure_metadata(metadata_path, error_number);
+            fprintf(stderr, "cpu_supervisor: termination requested before worker release\n");
             return 125;
         }
         const char release = 'R';

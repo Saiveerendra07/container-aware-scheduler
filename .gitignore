@@ -1,5 +1,6 @@
 *.o
 *.out
+/build/
 workloads/cpu_worker
 __pycache__/
 .venv/
