@@ -1,0 +1,24 @@
+Timestamp: 2026-11-04T12:08:24+05:30
+Kernel version: 7.0.0-38-generic
+Logical CPUs: 16
+Requested workers: 2
+Requested duration per worker (seconds): 3
+Workers started: 2
+
+Worker 1 PID: 23557
+Worker output (stdout and stderr):
+duration_seconds=3.000
+iterations=199996351
+result=18345932132965753433
+
+Worker 1 exit status: 0
+
+Worker 2 PID: 23559
+Worker output (stdout and stderr):
+duration_seconds=3.000
+iterations=201236110
+result=8945526211106818356
+
+Worker 2 exit status: 0
+
+Total elapsed time (monotonic, seconds): 3.02

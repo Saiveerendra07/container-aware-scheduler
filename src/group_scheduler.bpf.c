@@ -43,7 +43,7 @@ static __u32 find_group_index(struct task_struct *p)
 	__u64 cgroup_id;
 	__u32 i;
 
-	cgrp = __COMPAT_scx_bpf_task_cgroup(p);
+	cgrp = scx_bpf_task_cgroup(p);
 	if (!cgrp)
 		return FALLBACK_GROUP_INDEX;
 
