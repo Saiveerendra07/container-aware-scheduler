@@ -1,0 +1,24 @@
+Timestamp: 2026-11-14T10:46:50+00:00
+Kernel version: 6.6.87.2-microsoft-standard-WSL2
+Logical CPUs: 12
+Requested workers: 2
+Requested duration per worker (seconds): 3
+Workers started: 2
+
+Worker 1 PID: 10869
+Worker output (stdout and stderr):
+duration_seconds=3.000
+iterations=124489084
+result=2124836826018721987
+
+Worker 1 exit status: 0
+
+Worker 2 PID: 10871
+Worker output (stdout and stderr):
+duration_seconds=3.000
+iterations=124781745
+result=12116282678057332905
+
+Worker 2 exit status: 0
+
+Total elapsed time (monotonic, seconds): 3.02
