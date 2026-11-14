@@ -21,8 +21,8 @@ Options:
   --share-b N          Scheduler share for group batch (default: 300)
   --fallback-share N   Share for all unmatched tasks (default: 100)
   --parent DIR         Existing cgroup-v2 parent (default: /sys/fs/cgroup)
-  --loader PATH        Scheduler loader (default: build/group_scheduler)
-  --bpf-object PATH    BPF object (default: build/group_scheduler.bpf.o)
+  --loader PATH        Scheduler loader (default: detected build directory)
+  --bpf-object PATH    BPF object (default: detected build directory)
   --worker PATH        CPU worker (default: build/cpu_worker)
   --supervisor PATH    CPU supervisor (default: build/cpu_supervisor)
   -h, --help           Show this help
@@ -81,8 +81,14 @@ done
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd -- "$script_dir/.." && pwd)
 cd "$repo_root"
-loader=${loader:-$repo_root/build/group_scheduler}
-bpf_object=${bpf_object:-$repo_root/build/group_scheduler.bpf.o}
+build_dir=${CAS_BUILD_DIR:-$repo_root/build}
+# Reuse the known institute build location when the repository build/ folder
+# does not yet contain the sched_ext artifacts.
+if [[ ! -x $build_dir/group_scheduler && -x /tmp/cas-build-linux70-oldheaders/group_scheduler ]]; then
+    build_dir=/tmp/cas-build-linux70-oldheaders
+fi
+loader=${loader:-$build_dir/group_scheduler}
+bpf_object=${bpf_object:-$build_dir/group_scheduler.bpf.o}
 worker=${worker:-$repo_root/build/cpu_worker}
 supervisor=${supervisor:-$repo_root/build/cpu_supervisor}
 preparer=$repo_root/scripts/prepare_custom_scheduler_experiment.py
