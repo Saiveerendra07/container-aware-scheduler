@@ -535,3 +535,8 @@ Linux scheduling. No runtime success is claimed here; mocked tests do not
 validate kernel attachment or shutdown. See
 [`docs/custom-scheduler-experiments.md`](docs/custom-scheduler-experiments.md)
 for exact run invocation, readiness/shutdown behavior, schema, and limits.
+
+
+## Project scope and remaining gaps
+
+The original brief, implementation mapping, validated claims, and remaining work are documented in [`docs/project-status-and-gaps.md`](docs/project-status-and-gaps.md). In particular, the current implementation uses configured static shares; it does not yet include the brief's demand/latency-driven share controller or a request-latency workload. No custom-scheduler p99-latency, context-switch, or migration improvement has been established.
