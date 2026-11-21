@@ -17,7 +17,7 @@ These are motivations and hypotheses. They are not findings established by the c
 
 | Item in the project brief | Current repository status | Evidence boundary |
 | --- | --- | --- |
-| Linux sched_ext/eBPF group scheduler | Implemented as experimental BPF struct-ops scheduler and userspace loader | Compiled successfully on the previously checked institute Linux 7.0 host; not runtime-attached |
+| Linux sched_ext/eBPF group scheduler | Implemented as experimental BPF struct-ops scheduler and userspace loader | Initial attachment and workload-execution run succeeded on the institute Linux 7.0 host; weighted fairness is not yet established |
 | Per-container/group CPU shares | Static per-group shares and fallback share are accepted by the loader | Do not describe them as dynamically changing shares |
 | CPU usage accounting and dispatch by group | Group scheduler source includes weighted virtual-time accounting and per-group dispatch queues | Runtime behavior remains unverified |
 | Multi-threaded web-style service and load generator | Not implemented in the current documented workload set | Current workload is synthetic CPU-bound worker; no request latency distribution |
@@ -26,9 +26,9 @@ These are motivations and hypotheses. They are not findings established by the c
 | Dynamic share controller based on demand/latency | Not implemented | Shares are configured as run parameters; no controller watches latency or updates them |
 | Normal Linux baseline | Implemented and measured with CPU workload runners | These are baseline results under the active default scheduler |
 | cgroup CPU weights / limits | Cgroup-v2 experiment runner and analysis path are implemented | Depends on delegated writable cgroup-v2 access; distinguish these from sched_ext runs |
-| Custom scheduler comparison | Experiment harness is implemented and guarded by attachment/identity/completion/shutdown checks | No successful custom-scheduler runtime run or performance comparison yet |
+| Custom scheduler comparison | Experiment harness is implemented and guarded by attachment/identity/completion/shutdown checks | Initial runtime run was complete and shut down cleanly; one sample measured 42.7%/57.3%, not a 25%/75% target |
 | p99 request latency | Not measured | No request-serving workload or latency load generator currently provides p99 |
-| Fairness / weighted share error | Analysis tools exist for compatible group/cgroup measurements | Existing baseline records do not prove custom scheduler fairness; no custom scheduler data |
+| Fairness / weighted share error | Analysis tools exist for compatible group/cgroup measurements | Initial custom run exists, but repeated controlled weighted-fairness validation is incomplete |
 | Context switches / CPU migrations / cache misses | Not currently collected as a validated custom scheduler comparison | Do not claim reduced switching or migration overhead |
 | Repeated runs and charts | Analysis, plotting, and repeated-run summary tooling exist | Only analyze compatible completed records; no statistical significance claim from descriptive summaries |
 
@@ -45,7 +45,7 @@ The following can be demonstrated from the current WSL2 environment:
 
 The current WSL2 kernel does not expose `/sys/kernel/sched_ext/state`, so it cannot provide evidence of a real sched_ext attach or custom-scheduler run.
 
-The institute host previously compiled the custom scheduler against its target-kernel BTF and a compatible sched_ext header worktree. However, the observed cgroup-v2 mount was read-only for the experiment setup and the user lacked the necessary capabilities/delegation. No custom scheduler runtime result was obtained there either.
+The institute host compiled the custom scheduler against its target-kernel BTF and a compatible sched_ext header worktree. A later authorized run confirmed attachment, executed both verified cgroups, completed the workload, and detached cleanly. The initial 100:300 allocation result was 42.7%:57.3% across the measured rows, so weighted 25%:75% enforcement remains under evaluation rather than demonstrated.
 
 ## 4. Claims that are safe for the final presentation
 

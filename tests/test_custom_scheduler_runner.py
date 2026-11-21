@@ -50,7 +50,9 @@ class CustomSchedulerRunnerTests(unittest.TestCase):
                            "path": str(path)})
         return [dict(group, verified_cgroup_id=group["cgroup_id"],
                      identity_verification_status="verified",
-                     identity_verification_method="synthetic_test_only") for group in groups]
+                 identity_verification_method=runner.IDENTITY_VERIFICATION_METHOD,
+                 cgroup_mount_id=42, cgroup_filesystem="cgroup2")
+            for group in groups]
 
     def test_group_validation_rejects_duplicate_identity_and_invalid_shares(self):
         runner = load_runner()
@@ -60,6 +62,106 @@ class CustomSchedulerRunnerTests(unittest.TestCase):
                 runner.validate_groups([groups[0], dict(groups[1], cgroup_id=101)], 100)
             with self.assertRaisesRegex(runner.ExperimentError, "fallback share"):
                 runner.validate_groups(groups, 0)
+
+    def test_run_rejects_missing_or_mismatched_verified_identity_before_outputs(self):
+        runner = load_runner()
+        with tempfile.TemporaryDirectory(prefix="synthetic_test_only_") as temp:
+            root = Path(temp)
+            groups = self.setup_groups(root, runner)
+            args = SimpleNamespace(output_dir=root / "out", fallback_share=50,
+                                   duration=1, worker=Path("build/cpu_worker"))
+            invalid_sets = (
+                [dict(groups[0], verified_cgroup_id=999), groups[1]],
+                [{key: value for key, value in groups[0].items()
+                  if key != "verified_cgroup_id"}, groups[1]],
+                [dict(groups[0], identity_verification_status="unverified"), groups[1]],
+                [dict(groups[0], identity_verification_method=""), groups[1]],
+                [dict(groups[0], cgroup_mount_id="42"), groups[1]],
+                [dict(groups[0], cgroup_filesystem="tmpfs"), groups[1]],
+                                [dict(groups[0], share=True), groups[1]],
+                                [dict(groups[0], path="relative/cgroup"), groups[1]],
+            )
+            for invalid in invalid_sets:
+                with self.subTest(group=invalid[0]):
+                    with self.assertRaises(runner.ExperimentError):
+                        runner.run_experiment(args, invalid)
+                    self.assertFalse((root / "out").exists())
+
+    def test_cli_run_preserves_verified_identity_in_manifest_and_csv(self):
+        runner = load_runner()
+        with tempfile.TemporaryDirectory(prefix="synthetic_test_only_") as temp:
+            root = Path(temp)
+            groups = []
+            for name, cgroup_id, share in (("latency", 12112, 40), ("batch", 12163, 60)):
+                path = root / name
+                path.mkdir()
+                (path / "cgroup.procs").write_text("", encoding="ascii")
+                (path / "cpu.weight").write_text("100", encoding="ascii")
+                (path / "cpu.max").write_text("max 100000", encoding="ascii")
+                groups.append({"name": name, "cgroup_id": cgroup_id, "share": share,
+                               "path": str(path)})
+
+            loader = executable(root / "loader", """
+import signal, sys, time
+signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+print('GROUP_SCHEDULER_ATTACHED', flush=True)
+while True: time.sleep(.02)
+""")
+            supervisor = executable(root / "supervisor", """
+import pathlib, sys
+pathlib.Path(sys.argv[3]).write_text(
+    '123\\t1000000000\\t1000000\\t500000\\t0\\t0\\t0\\t0\\n',
+    encoding='ascii')
+""")
+            worker = executable(root / "worker", "pass\n")
+            bpf_object = root / "scheduler.o"
+            bpf_object.write_bytes(
+                b"\x7fELF\x02\x01" + b"\x00" * 12 + (247).to_bytes(2, "little"))
+            btf = root / "btf"
+            btf.write_bytes(b"synthetic_test_only")
+            state = root / "sched_ext_state"
+            state.write_text("disabled\n", encoding="ascii")
+
+            def fake_check(args):
+                validated = runner.validate_groups(args.group, args.fallback_share)
+                return [{**group,
+                         "verified_cgroup_id": group["cgroup_id"],
+                         "identity_verification_status": "verified",
+                         "identity_verification_method": runner.IDENTITY_VERIFICATION_METHOD,
+                         "cgroup_mount_id": 42,
+                         "cgroup_filesystem": "cgroup2"}
+                        for group in validated]
+
+            argv = [
+                "run", "--duration", "1", "--fallback-share", "10",
+                "--output-dir", str(root / "out"),
+                "--loader", str(loader), "--bpf-object", str(bpf_object),
+                "--supervisor", str(supervisor), "--worker", str(worker),
+                "--btf", str(btf), "--sched-ext-state", str(state),
+            ]
+            for group in groups:
+                argv.extend(["--group",
+                             f"{group['name']}:{group['cgroup_id']}:{group['share']}:{group['path']}"])
+
+            with mock.patch.object(runner, "check_prerequisites", side_effect=fake_check):
+                self.assertEqual(runner.main(argv), 0)
+
+            manifest = json.loads(next((root / "out").glob("*.json")).read_text())
+            csv_rows = self.read_rows(next((root / "out").glob("*.csv")))
+            self.assertTrue(all(group["identity_verification_status"] == "verified"
+                                for group in manifest["scheduler_groups"]))
+            self.assertEqual(
+                [group["verified_cgroup_id"] for group in manifest["scheduler_groups"]],
+                [12112, 12163])
+            self.assertEqual([group["cgroup_mount_id"]
+                              for group in manifest["scheduler_groups"]], [42, 42])
+            self.assertEqual([group["cgroup_filesystem"]
+                              for group in manifest["scheduler_groups"]],
+                             ["cgroup2", "cgroup2"])
+            self.assertTrue(all(row["verified_cgroup_id"] == row["cgroup_id"]
+                                for row in csv_rows))
+            self.assertTrue(all(row["measurement_status"] == "complete"
+                                for row in csv_rows))
 
     def test_prepare_writes_unique_manifest_and_na_rows_without_launching(self):
         runner = load_runner()
@@ -512,6 +614,60 @@ pathlib.Path(sys.argv[3]).write_text('123\\t1000000000\\t1000000\\t500000\\t0\\t
                              "kill_timeout_pid_43210")
             self.assertIn("kill_timeout_pid_43210", manifest["error"])
             self.assertTrue(all(row["measurement_status"] == "incomplete" for row in rows))
+
+    def test_worker_startup_failure_invalidates_measurements_and_stops_loader(self):
+        runner = load_runner()
+        with tempfile.TemporaryDirectory(prefix="synthetic_test_only_") as temp:
+            root = Path(temp)
+            groups = self.setup_groups(root, runner)
+            loader = executable(root / "loader", """
+import signal, sys, time
+signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+print('GROUP_SCHEDULER_ATTACHED', flush=True)
+while True: time.sleep(.02)
+""")
+            supervisor = executable(root / "supervisor", """
+import pathlib, sys
+pathlib.Path(sys.argv[3]).write_text('123\\tNA\\tNA\\tNA\\t127\\t0\\t2\\t0\\n')
+sys.exit(127)
+""")
+            args = SimpleNamespace(output_dir=root / "out", fallback_share=50,
+                                   duration=1, loader=loader, worker=root / "worker",
+                                   supervisor=supervisor, attach_timeout=2)
+            self.assertEqual(runner.run_experiment(args, groups), 1)
+            manifest = json.loads(next((root / "out").glob("*.json")).read_text())
+            rows = self.read_rows(next((root / "out").glob("*.csv")))
+            self.assertEqual(manifest["scheduler_shutdown_status"], "stopped")
+            self.assertTrue(all(row["measurement_status"] == "incomplete" for row in rows))
+            self.assertTrue(all(row["cpu_time_s"] == "NA" for row in rows))
+
+    def test_worker_timeout_stops_children_and_marks_run_incomplete(self):
+        runner = load_runner()
+        with tempfile.TemporaryDirectory(prefix="synthetic_test_only_") as temp:
+            root = Path(temp)
+            groups = self.setup_groups(root, runner)
+            loader = executable(root / "loader", """
+import signal, sys, time
+signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+print('GROUP_SCHEDULER_ATTACHED', flush=True)
+while True: time.sleep(.02)
+""")
+            supervisor = executable(root / "supervisor", """
+import signal, sys, time
+signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+while True: time.sleep(.02)
+""")
+            args = SimpleNamespace(output_dir=root / "out", fallback_share=50,
+                                   duration=5, worker_timeout=0.1, loader=loader,
+                                   worker=root / "worker", supervisor=supervisor,
+                                   attach_timeout=2)
+            self.assertEqual(runner.run_experiment(args, groups), 1)
+            manifest = json.loads(next((root / "out").glob("*.json")).read_text())
+            rows = self.read_rows(next((root / "out").glob("*.csv")))
+            self.assertIn("worker supervisor for group alpha timed out", manifest["error"])
+            self.assertEqual(manifest["scheduler_shutdown_status"], "stopped")
+            self.assertTrue(all(row["measurement_status"] == "incomplete" for row in rows))
+            self.assertTrue(all(row["cpu_time_s"] == "NA" for row in rows))
 
     def test_supervisor_shutdown_timeout_is_bounded_and_reports_pid(self):
         runner = load_runner()

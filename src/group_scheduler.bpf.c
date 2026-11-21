@@ -20,18 +20,18 @@ struct {
 	__type(value, __u64);
 } group_running_count SEC(".maps");
 
-struct cpu_runtime_ctx {
-	__u64 start_runtime;
-	__u32 group_index;
-	__u32 running;
+struct task_runtime_ctx {
+        __u64 start_runtime;
+        __u32 group_index;
+        __u32 running;
 };
 
 struct {
-	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-	__uint(max_entries, 1);
-	__type(key, __u32);
-	__type(value, struct cpu_runtime_ctx);
-} cpu_runtime SEC(".maps");
+        __uint(type, BPF_MAP_TYPE_TASK_STORAGE);
+        __uint(map_flags, BPF_F_NO_PREALLOC);
+        __type(key, int);
+        __type(value, struct task_runtime_ctx);
+} task_runtime SEC(".maps");
 
 UEI_DEFINE(uei);
 
@@ -170,6 +170,53 @@ static void mark_group_stopped(__u32 index)
 	__sync_fetch_and_sub(running_count, 1);
 }
 
+static __u64 saturating_vtime_increment(__u64 runtime, __u64 total_share,
+					__u64 share)
+{
+	if (!share || !total_share)
+		return 0;
+	/*
+	 * sched_ext slices are normally far below 2^32 runtime units. Cap
+	 * unusually large intervals before multiplication; at the scheduler's
+	 * maximum 72000:1 share ratio, 2^32 runtime units remains well below
+	 * the 64-bit product limit.
+	 */
+	if (runtime >= (__u64)0x100000000ULL)
+		return (__u64)0xffffffffffffffffULL;
+	return runtime * total_share / share;
+}
+
+static void add_vtime_saturating(__u32 index, __u64 runtime)
+{
+	__u64 *vtime;
+	__u64 share;
+	__u64 increment;
+	__u32 key = index;
+	__u32 retry;
+
+	share = group_share(index);
+	if (!share)
+		return;
+	vtime = bpf_map_lookup_elem(&group_vtime, &key);
+	if (!vtime)
+		return;
+
+	increment = saturating_vtime_increment(runtime,
+					       scheduler_config.total_share,
+					       share);
+	for (retry = 0; retry < 4; retry++) {
+		__u64 current = *vtime;
+		__u64 next;
+
+		if (increment > (~(__u64)0) - current)
+			next = ~(__u64)0;
+		else
+			next = current + increment;
+		if ((__u64)__sync_val_compare_and_swap(vtime, current, next) == current)
+			return;
+	}
+}
+
 s32 BPF_STRUCT_OPS(group_select_cpu, struct task_struct *p, s32 prev_cpu,
 		   u64 wake_flags)
 {
@@ -180,16 +227,16 @@ s32 BPF_STRUCT_OPS(group_select_cpu, struct task_struct *p, s32 prev_cpu,
 
 void BPF_STRUCT_OPS(group_enqueue, struct task_struct *p, u64 enq_flags)
 {
-	__u32 index = find_group_index(p);
+    __u32 index = find_group_index(p);
 
-	if (index >= GROUP_SCHEDULER_MAX_SCHED_GROUPS) {
-		scx_bpf_error("invalid group index during enqueue");
-		return;
-	}
-	if (!rebase_idle_group(index))
-		return;
+    if (index >= GROUP_SCHEDULER_MAX_SCHED_GROUPS) {
+        scx_bpf_error("invalid group index during enqueue");
+        return;
+    }
+    if (!rebase_idle_group(index))
+        return;
 
-	scx_bpf_dsq_insert(p, index, SCX_SLICE_DFL, enq_flags);
+    scx_bpf_dsq_insert(p, index, SCX_SLICE_DFL, enq_flags);
 }
 
 void BPF_STRUCT_OPS(group_dispatch, s32 cpu, struct task_struct *prev)
@@ -227,80 +274,92 @@ void BPF_STRUCT_OPS(group_dispatch, s32 cpu, struct task_struct *prev)
 
 void BPF_STRUCT_OPS(group_running, struct task_struct *p)
 {
-	struct cpu_runtime_ctx *runtime_ctx;
-	__u32 key = 0;
+        struct task_runtime_ctx *task_ctx;
+        __u32 index;
+        __u32 key;
 
-	runtime_ctx = bpf_map_lookup_elem(&cpu_runtime, &key);
-	if (!runtime_ctx) {
-		scx_bpf_error("CPU runtime context lookup failed during running");
-		return;
-	}
+        task_ctx = bpf_task_storage_get(&task_runtime, p, 0,
+                                   BPF_LOCAL_STORAGE_GET_F_CREATE);
+        if (!task_ctx) {
+                scx_bpf_error("Task runtime storage allocation failed");
+                return;
+        }
 
-	runtime_ctx->group_index = find_group_index(p);
-	runtime_ctx->start_runtime = p->se.sum_exec_runtime;
-	runtime_ctx->running = 0;
-	{
-		__u32 running_key = runtime_ctx->group_index;
-		__u64 *running_count;
+        if (task_ctx->running) {
+                scx_bpf_error("Task already marked running");
+                return;
+        }
 
-		if (running_key >= GROUP_SCHEDULER_MAX_SCHED_GROUPS) {
-			scx_bpf_error("invalid group index during running");
-			return;
-		}
-		running_count = bpf_map_lookup_elem(&group_running_count, &running_key);
-		if (!running_count) {
-			scx_bpf_error("group running-count lookup failed during running");
-			return;
-		}
-		__sync_fetch_and_add(running_count, 1);
-	}
-	runtime_ctx->running = 1;
+        index = find_group_index(p);
+        if (index >= GROUP_SCHEDULER_MAX_SCHED_GROUPS) {
+                scx_bpf_error("Invalid group index during running");
+                return;
+        }
+
+        key = index;
+        {
+                __u64 *running_count;
+
+                running_count = bpf_map_lookup_elem(&group_running_count,
+                                                     &key);
+                if (!running_count) {
+                        scx_bpf_error("Group running-count lookup failed");
+                        return;
+                }
+
+                __sync_fetch_and_add(running_count, 1);
+        }
+
+        task_ctx->group_index = index;
+        task_ctx->start_runtime = p->se.sum_exec_runtime;
+        task_ctx->running = 1;
 }
 
 void BPF_STRUCT_OPS(group_stopping, struct task_struct *p, bool runnable)
 {
-	struct cpu_runtime_ctx *runtime_ctx;
-	__u64 *vtime;
-	__u64 runtime;
-	__u64 share;
-	__u32 key = 0;
-	__u32 group_key;
-	__u32 index;
+        struct task_runtime_ctx *task_ctx;
+        __u64 runtime;
+        __u64 current_runtime;
+        __u32 index;
 
-	runtime_ctx = bpf_map_lookup_elem(&cpu_runtime, &key);
-	if (!runtime_ctx || !runtime_ctx->running) {
-		scx_bpf_error("CPU runtime context missing during stopping");
-		return;
-	}
+        task_ctx = bpf_task_storage_get(&task_runtime, p, 0, 0);
+        if (!task_ctx || !task_ctx->running) {
+                scx_bpf_error("Task runtime context missing during stopping");
+                return;
+        }
 
-	index = runtime_ctx->group_index;
-	runtime_ctx->running = 0;
-	if (index >= GROUP_SCHEDULER_MAX_SCHED_GROUPS) {
-		scx_bpf_error("invalid group index during stopping");
-		return;
-	}
-	runtime = p->se.sum_exec_runtime - runtime_ctx->start_runtime;
-	if (!runtime) {
-		mark_group_stopped(index);
-		return;
-	}
+        index = task_ctx->group_index;
+        task_ctx->running = 0;
 
-	share = group_share(index);
-	if (!share) {
-		scx_bpf_error("zero group share during stopping");
-		return;
-	}
+        if (index >= GROUP_SCHEDULER_MAX_SCHED_GROUPS) {
+                scx_bpf_error("Invalid group index during stopping");
+                return;
+        }
 
-	group_key = index;
-	vtime = bpf_map_lookup_elem(&group_vtime, &group_key);
-	if (!vtime) {
-		scx_bpf_error("group virtual-time lookup failed during stopping");
-		return;
-	}
+        current_runtime = p->se.sum_exec_runtime;
+        if (current_runtime < task_ctx->start_runtime) {
+                mark_group_stopped(index);
+                scx_bpf_error("Task execution runtime moved backwards");
+                return;
+        }
 
-	__sync_fetch_and_add(vtime,
-			     runtime * scheduler_config.total_share / share);
-	mark_group_stopped(index);
+        runtime = current_runtime - task_ctx->start_runtime;
+
+        if (!runtime) {
+                mark_group_stopped(index);
+                return;
+        }
+
+        if (!group_share(index)) {
+                mark_group_stopped(index);
+                scx_bpf_error("Zero group share during stopping");
+                return;
+        }
+
+        if (scheduler_config.total_share)
+                add_vtime_saturating(index, runtime);
+
+        mark_group_stopped(index);
 }
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(group_init)

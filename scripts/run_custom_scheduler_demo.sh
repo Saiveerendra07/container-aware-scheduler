@@ -17,12 +17,14 @@ Usage:
 
 Options:
   --duration SEC       Worker duration per group (default: 10)
+    --worker-timeout SEC  Maximum supervisor runtime (default: duration + 30)
   --share-a N          Scheduler share for group latency (default: 100)
   --share-b N          Scheduler share for group batch (default: 300)
   --fallback-share N   Share for all unmatched tasks (default: 100)
   --parent DIR         Existing cgroup-v2 parent (default: /sys/fs/cgroup)
   --loader PATH        Scheduler loader (default: detected build directory)
   --bpf-object PATH    BPF object (default: detected build directory)
+    --libbpf-libdir DIR  Directory containing the matching libbpf.so.1
   --worker PATH        CPU worker (default: build/cpu_worker)
   --supervisor PATH    CPU supervisor (default: build/cpu_supervisor)
   -h, --help           Show this help
@@ -36,30 +38,34 @@ EOF
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 2; }
 
 duration=10
+worker_timeout=
 share_a=100
 share_b=300
 fallback_share=100
 parent=/sys/fs/cgroup
 loader=
 bpf_object=
+libbpf_libdir=${CAS_LIBBPF_LIBDIR:-}
 worker=
 supervisor=
 
 while (($#)); do
     case "$1" in
-        --duration|--share-a|--share-b|--fallback-share|--parent|--loader|--bpf-object|--worker|--supervisor)
+        --duration|--worker-timeout|--share-a|--share-b|--fallback-share|--parent|--loader|--bpf-object|--libbpf-libdir|--worker|--supervisor)
             (($# >= 2)) || fail "$1 requires a value"
             option=$1
             value=$2
             shift 2
             case "$option" in
                 --duration) duration=$value ;;
+                --worker-timeout) worker_timeout=$value ;;
                 --share-a) share_a=$value ;;
                 --share-b) share_b=$value ;;
                 --fallback-share) fallback_share=$value ;;
                 --parent) parent=$value ;;
                 --loader) loader=$value ;;
                 --bpf-object) bpf_object=$value ;;
+                --libbpf-libdir) libbpf_libdir=$value ;;
                 --worker) worker=$value ;;
                 --supervisor) supervisor=$value ;;
             esac
@@ -77,23 +83,32 @@ for item in "$share_a" "$share_b" "$fallback_share"; do
     [[ $item =~ ^[0-9]+$ ]] || fail "shares must be integers from 1 to 10000"
     ((10#$item >= 1 && 10#$item <= 10000)) || fail "shares must be integers from 1 to 10000"
 done
+if [[ -n $worker_timeout ]]; then
+    [[ $worker_timeout =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]] \
+        && awk -v value="$worker_timeout" 'BEGIN { exit !(value > 0) }' \
+        || fail "worker timeout must be a positive finite number"
+fi
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd -- "$script_dir/.." && pwd)
 cd "$repo_root"
 build_dir=${CAS_BUILD_DIR:-$repo_root/build}
-# Reuse the known institute build location when the repository build/ folder
-# does not yet contain the sched_ext artifacts.
-if [[ ! -x $build_dir/group_scheduler && -x /tmp/cas-build-linux70-oldheaders/group_scheduler ]]; then
-    build_dir=/tmp/cas-build-linux70-oldheaders
+# Reuse the supplied institute build directory when the repository build does
+# not contain the scheduler artifact. CAS_BUILD_DIR can select another build.
+if [[ -z ${CAS_BUILD_DIR:-} && ! -x $build_dir/group_scheduler \
+    && -x /tmp/cas-build-linux70/group_scheduler ]]; then
+    build_dir=/tmp/cas-build-linux70
 fi
 loader=${loader:-$build_dir/group_scheduler}
 bpf_object=${bpf_object:-$build_dir/group_scheduler.bpf.o}
-worker=${worker:-$repo_root/build/cpu_worker}
-supervisor=${supervisor:-$repo_root/build/cpu_supervisor}
+worker=${worker:-$build_dir/cpu_worker}
+supervisor=${supervisor:-$build_dir/cpu_supervisor}
 preparer=$repo_root/scripts/prepare_custom_scheduler_experiment.py
 runner=$repo_root/scripts/run_custom_scheduler_experiment.py
 results_dir=$repo_root/results/raw
+if [[ -z $libbpf_libdir && -r /tmp/container-aware-scheduler-deps/libbpflib64/libbpf.so.1 ]]; then
+    libbpf_libdir=/tmp/container-aware-scheduler-deps/libbpflib64
+fi
 
 [[ -d $parent && -r $parent/cgroup.procs ]] || fail "not a readable cgroup-v2 parent: $parent"
 awk -v target="$parent" '$0 ~ / - cgroup2 / { found=1 } END { exit !found }' /proc/self/mountinfo \
@@ -104,6 +119,21 @@ done
 for path in "$loader" "$worker" "$supervisor"; do
     [[ -x $path ]] || fail "required executable is missing or not executable: $path"
 done
+if [[ -n $libbpf_libdir ]]; then
+    [[ -d $libbpf_libdir && -r $libbpf_libdir/libbpf.so.1 ]] \
+        || fail "libbpf directory is missing libbpf.so.1: $libbpf_libdir"
+    libbpf_libdir=$(cd -- "$libbpf_libdir" && pwd)
+    export LD_LIBRARY_PATH="$libbpf_libdir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
+resolved_libbpf=$(ldd "$loader" 2>/dev/null | awk '$1 == "libbpf.so.1" && $2 == "=>" { print $3; exit }')
+[[ -n $resolved_libbpf ]] || fail "cannot resolve libbpf.so.1 for loader: $loader"
+if [[ -n $libbpf_libdir ]]; then
+    expected_libbpf=$(readlink -f -- "$libbpf_libdir/libbpf.so.1")
+    actual_libbpf=$(readlink -f -- "$resolved_libbpf")
+    [[ $actual_libbpf == "$expected_libbpf" ]] \
+        || fail "loader resolved libbpf at $actual_libbpf, expected $expected_libbpf"
+fi
+printf 'Loader libbpf: %s\n' "$(readlink -f -- "$resolved_libbpf")"
 state=/sys/kernel/sched_ext/state
 [[ -r $state ]] || fail "sched_ext state interface is unavailable: $state"
 [[ $(<"$state") == disabled ]] || fail "sched_ext must report disabled before this run (state: $(<"$state"))"
@@ -115,15 +145,22 @@ created=()
 capture=$(mktemp "${TMPDIR:-/tmp}/cas-demo-output.XXXXXX")
 
 cleanup() {
-    local path members
+    local status=$? path members cleanup_failed=0
+    trap - EXIT
     set +e
-    for path in "$group_a" "$group_b"; do
+    for path in "${created[@]}"; do
         [[ -d $path ]] || continue
-        members=$(<"$path/cgroup.procs" 2>/dev/null)
+        if ! members=$(cat -- "$path/cgroup.procs" 2>/dev/null); then
+            printf 'WARNING: cannot read cgroup membership; leaving cgroup untouched: %s\n' "$path" >&2
+            cleanup_failed=1
+            continue
+        fi
         if [[ -n $members ]]; then
             printf 'WARNING: leaving non-empty cgroup untouched: %s (PIDs: %s)\n' "$path" "$members" >&2
+            cleanup_failed=1
         elif ! rmdir -- "$path"; then
             printf 'WARNING: could not remove temporary cgroup: %s\n' "$path" >&2
+            cleanup_failed=1
         fi
     done
 
@@ -149,6 +186,10 @@ PY
         fi
     fi
     rm -f -- "$capture"
+    if (( cleanup_failed )); then
+        exit 1
+    fi
+    exit "$status"
 }
 trap cleanup EXIT
 trap 'exit 130' INT
@@ -173,6 +214,10 @@ printf '  batch:   cgroup_id=%s share=%s path=%s\n' "$id_b" "$share_b" "$group_b
 printf '  fallback share: %s\n' "$fallback_share"
 printf 'Starting the custom sched_ext experiment. Workers will not start unless attachment is confirmed.\n'
 
+worker_timeout_args=()
+if [[ -n $worker_timeout ]]; then
+    worker_timeout_args=(--worker-timeout "$worker_timeout")
+fi
 set +e
 python3 "$runner" run \
     --duration "$duration" \
@@ -181,7 +226,7 @@ python3 "$runner" run \
     --group "batch:$id_b:$share_b:$group_b" \
     --loader "$loader" --bpf-object "$bpf_object" \
     --worker "$worker" --supervisor "$supervisor" \
-    --output-dir "$results_dir" 2>&1 | tee "$capture"
+    --output-dir "$results_dir" "${worker_timeout_args[@]}" 2>&1 | tee "$capture"
 status=${PIPESTATUS[0]}
 set -e
 exit "$status"

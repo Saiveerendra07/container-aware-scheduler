@@ -27,8 +27,11 @@ the runner's monotonic total elapsed time. Cgroup CPU time is derived from
 `cpu.stat` usage-counter deltas. Group-runner `group_counts` are not treated as
 CPU weights.
 
-The custom sched_ext implementation has not been runtime-validated. Ordinary
-and cgroup measurements use the active default Linux scheduler; prepared
+The custom sched_ext implementation passed initial runtime attachment and
+workload execution tests. Its weighted CPU-share enforcement is under evaluation;
+the project has not established the target 25%/75% allocation from a repeated
+controlled study. Ordinary and cgroup measurements use the active default Linux
+scheduler; prepared
 manifests are listed as prepared, not run. Scheduler status is read from the
 local `/sys/kernel/sched_ext/state` interface. An enabled state is reported as
 running only when `/sys/kernel/sched_ext/root/ops` identifies this project's
@@ -37,3 +40,10 @@ unreadable identity is reported as unknown.
 
 If the results directory is missing or contains no real experiment data, the
 dashboard reports that state and does not synthesize measurements.
+
+For an SSH-friendly read-only terminal view, run:
+
+```sh
+python3 scripts/terminal_dashboard.py --once
+python3 scripts/terminal_dashboard.py
+```
