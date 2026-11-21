@@ -86,6 +86,12 @@ python3 scripts/run_custom_scheduler_experiment.py run --duration 10 \
   --group batch:12346:300:/sys/fs/cgroup/test/batch
 ```
 
+Each group supervisor has a finite deadline. By default it is the requested
+workload duration plus 30 seconds; pass `--worker-timeout SEC` to set a
+different positive deadline. A timeout stops supervisors with bounded
+TERM/KILL handling, then shuts down the loader. The run is marked incomplete;
+no timeout or failed cleanup is treated as a successful measurement.
+
 The loader prints `GROUP_SCHEDULER_ATTACHED` only after
 `bpf_map__attach_struct_ops()` succeeds. Without that exact readiness line the
 runner starts no workload, records an unsuccessful run with unavailable
@@ -149,8 +155,11 @@ Unit tests use controlled fake loader/supervisor processes and synthetic inputs.
 They check process cleanup, result invalidation, unique outputs, and attach
 timeouts, but do not validate real kernel cgroup migration, sched_ext
 attachment, weighted runtime behavior, or teardown.
-No runtime success is claimed until a supported sched_ext host has run the
-explicit command above and retained the raw output.
+Initial runtime validation: a preserved run on the institute Linux 7.0 host
+confirmed scheduler attachment, completed both verified cgroup workloads, and
+detached cleanly. Its raw CSV measured 42.7% and 57.3% for 100:300 shares;
+this is not a 25%/75% weighted-share result and repeated controlled validation
+remains required. The harness does not replace that evidence with synthetic tests.
 
 ## Cgroup identity verification
 

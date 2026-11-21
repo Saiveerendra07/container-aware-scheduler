@@ -21,6 +21,7 @@ import prepare_custom_scheduler_experiment as preparation
 
 
 READY_LINE = "GROUP_SCHEDULER_ATTACHED"
+IDENTITY_VERIFICATION_METHOD = "name_to_handle_at(FILEID_KERNFS)"
 PARENT_PID_ENV = "CAS_PARENT_PID"
 SUPERVISOR_TERM_TIMEOUT = 5
 SUPERVISOR_KILL_TIMEOUT = 3
@@ -74,6 +75,9 @@ def build_parser():
                              default=Path("/sys/kernel/sched_ext/state"))
             sub.add_argument("--btf", type=Path, default=Path("/sys/kernel/btf/vmlinux"))
             sub.add_argument("--attach-timeout", type=positive_duration, default=15.0)
+            if mode == "run":
+                sub.add_argument("--worker-timeout", type=positive_duration,
+                                 help="maximum seconds to wait per group supervisor (default: duration + 30)")
     return parser
 
 
@@ -106,7 +110,41 @@ def verify_groups(groups, verifier=preparation.verify_group_identity):
     return [verifier(group) for group in groups]
 
 
+def require_verified_groups(groups):
+    for group in groups:
+        if not isinstance(group, dict):
+            raise ExperimentError("verified group data must be a mapping")
+        name = group.get("name")
+        cgroup_id = group.get("cgroup_id")
+        verified_id = group.get("verified_cgroup_id")
+        share = group.get("share")
+        path = group.get("path")
+        if not isinstance(name, str) or not name:
+            raise ExperimentError("verified group name is missing")
+        if type(cgroup_id) is not int or not 0 < cgroup_id <= preparation.MAX_CGROUP_ID:
+            raise ExperimentError("requested cgroup ID is missing or invalid")
+        if type(verified_id) is not int or verified_id != cgroup_id:
+            raise ExperimentError(
+                f"verified cgroup ID is missing or does not match requested ID for {name!r}")
+        if type(share) is not int or not 1 <= share <= preparation.MAX_SHARE:
+            raise ExperimentError(f"configured share is missing or invalid for {name!r}")
+        if group.get("identity_verification_status") != "verified":
+            raise ExperimentError(f"cgroup identity is not verified for {name!r}")
+        if group.get("identity_verification_method") != IDENTITY_VERIFICATION_METHOD:
+            raise ExperimentError(
+                f"cgroup identity verification method is missing or unsupported for {name!r}")
+        mount_id = group.get("cgroup_mount_id")
+        if type(mount_id) is not int or mount_id <= 0:
+            raise ExperimentError(f"cgroup mount ID is missing or invalid for {name!r}")
+        if group.get("cgroup_filesystem") != "cgroup2":
+            raise ExperimentError(f"cgroup filesystem is not verified as cgroup2 for {name!r}")
+        if not isinstance(path, str) or not Path(path).is_absolute():
+            raise ExperimentError(f"verified cgroup path is missing or not absolute for {name!r}")
+    return groups
+
+
 def _expected_group_config(groups, fallback_share):
+    require_verified_groups(groups)
     return {
         "expected_group_count": len(groups),
         "fallback_share": fallback_share,
@@ -164,7 +202,7 @@ def _has_bpf_capability():
 def check_prerequisites(args, identity_verifier=preparation.verify_group_identity,
                         capability_check=_has_bpf_capability):
     groups = validate_groups(args.group, args.fallback_share)
-    verified = verify_groups(groups, identity_verifier)
+    verified = require_verified_groups(verify_groups(groups, identity_verifier))
     for group in verified:
         _check_cgroup_write_permission(group["path"])
     for path, label in ((args.loader, "scheduler loader"), (args.bpf_object, "BPF object"),
@@ -207,6 +245,7 @@ def _reserve_outputs(output_dir, mode):
 
 def _manifest(run_id, mode, groups, fallback_share, duration, csv_path, log_path,
               worker_path):
+    require_verified_groups(groups)
     expected_config = _expected_group_config(groups, fallback_share)
     return {
         "run_id": run_id, "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -218,8 +257,8 @@ def _manifest(run_id, mode, groups, fallback_share, duration, csv_path, log_path
             "verified_cgroup_id": g["verified_cgroup_id"],
             "identity_verification_status": g["identity_verification_status"],
             "identity_verification_method": g["identity_verification_method"],
-            "cgroup_mount_id": g.get("cgroup_mount_id", "NA"),
-            "cgroup_filesystem": g.get("cgroup_filesystem", "NA"),
+            "cgroup_mount_id": g["cgroup_mount_id"],
+            "cgroup_filesystem": g["cgroup_filesystem"],
             "cgroup_path": g["path"], "configured_scheduler_share": g["share"],
             "cgroup_cpu_weight": preparation.read_control(g["path"], "cpu.weight"),
             "cgroup_cpu_max": preparation.read_control(g["path"], "cpu.max"),
@@ -242,6 +281,7 @@ def _manifest(run_id, mode, groups, fallback_share, duration, csv_path, log_path
 
 def _write_csv(path, run_id, groups, fallback_share, duration, status, error="",
                attached=False, shutdown="not_started", rows=None, worker_path=None):
+    require_verified_groups(groups)
     rows = rows or {}
     expected_config_json = json.dumps(
         _expected_group_config(groups, fallback_share), sort_keys=True, separators=(",", ":"))
@@ -258,11 +298,11 @@ def _write_csv(path, run_id, groups, fallback_share, duration, status, error="",
                 "architecture": platform.machine(),
                 "worker_executable": str(Path(worker_path).resolve()) if worker_path else "NA",
                 "cgroup_id": group["cgroup_id"], "cgroup_path": group["path"],
-                "verified_cgroup_id": group.get("verified_cgroup_id", "NA"),
-                "identity_verification_status": group.get("identity_verification_status", "unverified"),
-                "identity_verification_method": group.get("identity_verification_method", "NA"),
-                "cgroup_mount_id": group.get("cgroup_mount_id", "NA"),
-                "cgroup_filesystem": group.get("cgroup_filesystem", "NA"),
+                "verified_cgroup_id": group["verified_cgroup_id"],
+                "identity_verification_status": group["identity_verification_status"],
+                "identity_verification_method": group["identity_verification_method"],
+                "cgroup_mount_id": group["cgroup_mount_id"],
+                "cgroup_filesystem": group["cgroup_filesystem"],
                 "group_share": group["share"], "fallback_share": fallback_share,
                 "share_source": "scheduler --group configuration",
                 "cgroup_cpu_weight": preparation.read_control(group["path"], "cpu.weight"),
@@ -432,15 +472,23 @@ def _stop_supervisors(supervisors):
 
 def run_experiment(args, groups, *, popen=subprocess.Popen):
     """Run after preflight; kept injectable so lifecycle failures are testable."""
+    groups = require_verified_groups(groups)
+    worker_timeout = getattr(args, "worker_timeout", None)
+    if worker_timeout is None:
+        worker_timeout = args.duration + 30.0
+    if worker_timeout <= 0:
+        raise ExperimentError("worker timeout must be positive")
     run_id, csv_path, manifest_path, log_path = _reserve_outputs(args.output_dir, "run")
     manifest = _manifest(run_id, "run", groups, args.fallback_share, args.duration,
                          csv_path, log_path, args.worker)
+    manifest["worker_timeout_s"] = worker_timeout
     rows = {}
     attached = False
     shutdown = "not_started"
     loader = None
     error = ""
     supervisors = []
+    supervisor_deadlines = {}
     metadata_files = []
     cancel_files = []
     run_experiment.interrupted = 0
@@ -484,11 +532,17 @@ def run_experiment(args, groups, *, popen=subprocess.Popen):
                 metadata_files.append(metadata_path); cancel_files.append(cancel_path)
                 command = [str(args.supervisor), "--cgroup", group["path"], str(metadata_path),
                            str(args.worker), str(args.duration), str(cancel_path)]
-                supervisors.append((group, popen(command, stdout=log, stderr=log,
-                                                   start_new_session=True,
-                                                   env=child_env)))
+                supervisor = popen(command, stdout=log, stderr=log,
+                                   start_new_session=True, env=child_env)
+                supervisors.append((group, supervisor))
+                supervisor_deadlines[group["name"]] = (
+                    time.monotonic() + worker_timeout)
             for index, (group, supervisor) in enumerate(supervisors):
                 while supervisor.poll() is None:
+                    if time.monotonic() >= supervisor_deadlines[group["name"]]:
+                        raise ExperimentError(
+                            f"worker supervisor for group {group['name']} timed out "
+                            f"after {worker_timeout:g} seconds")
                     if loader.poll() is not None:
                         raise ExperimentError("scheduler loader exited while workloads were running")
                     if getattr(run_experiment, "interrupted", False):
@@ -561,6 +615,7 @@ def run_experiment(args, groups, *, popen=subprocess.Popen):
 
 
 def prepare_experiment(args, groups):
+    groups = require_verified_groups(groups)
     run_id, csv_path, manifest_path, log_path = _reserve_outputs(args.output_dir, "prepare")
     metadata = _manifest(run_id, "prepare", groups, args.fallback_share, args.duration,
                          csv_path, log_path, args.worker)
@@ -578,16 +633,15 @@ def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
-        groups = validate_groups(args.group, args.fallback_share)
-        groups = verify_groups(groups)
         if args.mode == "prepare":
+            groups = require_verified_groups(
+                verify_groups(validate_groups(args.group, args.fallback_share)))
             return prepare_experiment(args, groups)
         if args.mode == "check":
-            # Reuse verified identities to ensure check and run have the same gate.
-            checked = check_prerequisites(args, identity_verifier=lambda group: group)
+            checked = check_prerequisites(args)
             print(f"Checks passed for {len(checked)} verified groups; no scheduler attached or workload started.")
             return 0
-        checked = check_prerequisites(args, identity_verifier=lambda group: group)
+        checked = check_prerequisites(args)
         return run_experiment(args, checked)
     except (OSError, ValueError, ExperimentError, preparation.IdentityVerificationError) as exc:
         print(f"custom scheduler experiment: {exc}", file=sys.stderr)

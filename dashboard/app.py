@@ -78,6 +78,28 @@ def scheduler_status(state_path=SCHED_EXT_STATE, ops_path=SCHED_EXT_OPS):
     return "Unknown"
 
 
+def historical_scheduler_status(data):
+    """Summarize successful and failed custom-scheduler run records separately."""
+    attached = 0
+    failed = 0
+    for item in data.get("history", []):
+        manifest = item.get("manifest")
+        if manifest:
+            if str(manifest.get("scheduler_attached", "")).lower() == "true":
+                attached += 1
+            elif manifest.get("mode") == "run":
+                failed += 1
+            continue
+        if item.get("experiment_type") == "Custom sched_ext":
+            status = str(item.get("status", "")).lower()
+            if status == "complete":
+                attached += 1
+    for run in data.get("experiments", []):
+        if run.get("result_type") == "custom_scheduler" and run.get("status") == "complete":
+            attached += 1
+    return attached, failed
+
+
 def _fixture_path(path, root):
     try:
         parts = path.relative_to(root).parts
@@ -604,13 +626,20 @@ def main():
         availability = "No real experiment results"
 
     st.header("Project Overview")
-    st.write("This project explores CPU accounting and weighted sharing between workload groups. The custom Linux sched_ext/eBPF scheduler is experimental and has not been runtime-validated; ordinary and cgroup runs use the active default Linux scheduler.")
+    st.write("This project explores CPU accounting and weighted sharing between workload groups. The custom sched_ext/eBPF scheduler passed initial runtime attachment and workload execution tests; enforcement of its weighted CPU shares remains under evaluation. Ordinary and cgroup runs use the active default Linux scheduler.")
     overview = st.columns(5)
     overview[0].metric("Scheduler status", scheduler_status())
     overview[1].metric("Latest experiment", latest[:19].replace("T", " ") if latest else "None detected")
     overview[2].metric("Experiment runs", len(real_experiments))
     overview[3].metric("Workload groups", len(detected_groups))
     overview[4].metric("Data availability", availability)
+    attached_runs, failed_runs = historical_scheduler_status(data)
+    if attached_runs or failed_runs:
+        st.caption(
+            f"Historical custom sched_ext: {attached_runs} attached/completed run(s), "
+            f"{failed_runs} failed or incomplete run(s). "
+            "These counts do not make the current scheduler status running."
+        )
     if not real_experiments:
         st.info("No real experiment CSV results or run manifests are available in this directory. No measurements are shown. Prepared manifests are not counted as runs.")
     if data["fixture_count"] and not include_fixtures:

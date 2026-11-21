@@ -1,9 +1,10 @@
 # Container-Aware Group CPU Scheduler
 
 > **Project status:** The Linux `sched_ext` BPF scheduler and userspace loader
-> are implemented, but have **not been validated at runtime**. Existing runner
-> measurements use the default Linux scheduler. Do not claim a custom-scheduler
-> comparison until it has been run and measured on a compatible Linux system.
+> have passed an initial runtime attachment and workload execution test. Weighted
+> CPU-share enforcement remains under evaluation. Existing ordinary runner
+> measurements use the default Linux scheduler and must not be presented as
+> custom-scheduler measurements.
 
 ## Overview
 
@@ -147,6 +148,17 @@ python3 scripts/analyze_results.py --help
 python3 scripts/plot_results.py --help
 bash scripts/generate_experiment_report.sh --help
 ```
+
+View existing experiment results directly in a terminal:
+
+```sh
+python3 scripts/terminal_dashboard.py --once
+python3 scripts/terminal_dashboard.py
+```
+
+The terminal dashboard is read-only. It never attaches the custom scheduler,
+executes workloads, or runs privileged commands. Use `q` to quit live mode,
+`r` to refresh, `h` to show history, and `d` to show latest group details.
 
 Run safe checks that do not start workloads or require cgroup privileges:
 
@@ -377,7 +389,8 @@ would explicitly load and attach sched_ext and requires a compatible kernel,
 suitable privileges, carefully prepared cgroups, and a recovery plan. The
 loader's actual configuration is `--fallback-share SHARE` plus at least two
 `--group CGROUP_ID:SHARE` options. Do not run it as a routine quick-start
-command; the custom scheduler has not yet been runtime validated. See
+command. An initial attachment/workload run is recorded, while repeated
+weighted-share enforcement remains under evaluation. See
 [`docs/scheduler-design.md`](docs/scheduler-design.md).
 
 ## Metrics: available and missing
@@ -535,3 +548,8 @@ Linux scheduling. No runtime success is claimed here; mocked tests do not
 validate kernel attachment or shutdown. See
 [`docs/custom-scheduler-experiments.md`](docs/custom-scheduler-experiments.md)
 for exact run invocation, readiness/shutdown behavior, schema, and limits.
+
+
+## Project scope and remaining gaps
+
+The original brief, implementation mapping, validated claims, and remaining work are documented in [`docs/project-status-and-gaps.md`](docs/project-status-and-gaps.md). In particular, the current implementation uses configured static shares; it does not yet include the brief's demand/latency-driven share controller or a request-latency workload. No custom-scheduler p99-latency, context-switch, or migration improvement has been established.
